@@ -1,0 +1,15 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Only track __init__.py inside tmp_scripts/
+tmp_scripts/**
+!tmp_scripts/
+!tmp_scripts/__init__.py
