@@ -45,7 +45,7 @@ class Skeleton:
         },
     }
 
-    def __init__(self, animation: Animation, names: list, frametime: float):
+    def __init__(self, animation: Animation, names: list, frametime: float, load_end_sites: bool = True):
         """
         Initialize the Skeleton with data from BVH.load().
 
@@ -57,8 +57,15 @@ class Skeleton:
             List of joint names
         frametime : float
             Frame time in seconds
+        load_end_sites : bool, optional
+            Whether to load end sites (end effectors) as joints. Default is True.
         """
         self.frametime = frametime
+        self.load_end_sites = load_end_sites
+
+        # Remove end sites if requested
+        if not load_end_sites:
+            animation, names = self._remove_end_sites(animation, names)
 
         # Build the joint tree
         self.skeleton = self._build_joint_tree(animation, names)
@@ -69,7 +76,7 @@ class Skeleton:
         self.default_orientation = self.guess_orientations()
 
     @staticmethod
-    def load(filename):
+    def load(filename, load_end_sites: bool = True):
         """
         Load a skeleton from a BVH file.
 
@@ -77,6 +84,8 @@ class Skeleton:
         ----------
         filename : str
             Path to the BVH file
+        load_end_sites : bool, optional
+            Whether to load end sites (end effectors) as joints. Default is True.
 
         Returns
         -------
@@ -84,7 +93,66 @@ class Skeleton:
             A new Skeleton instance loaded from the BVH file
         """
         animation, names, frametime = BVH.load(filename)
-        return Skeleton(animation, names, frametime)
+        return Skeleton(animation, names, frametime, load_end_sites)
+
+    def _remove_end_sites(self, animation: Animation, names: list):
+        """
+        Remove end sites (end effectors) from the animation and names.
+
+        Parameters
+        ----------
+        animation : Animation
+            The animation object
+        names : list
+            List of joint names
+
+        Returns
+        -------
+        tuple
+            (filtered_animation, filtered_names)
+        """
+        # Find indices of end sites
+        end_site_indices = [i for i, name in enumerate(names) if name.startswith("end_effector")]
+
+        if not end_site_indices:
+            return animation, names
+
+        # Create masks for joints to keep
+        keep_mask = np.ones(len(names), dtype=bool)
+        keep_mask[end_site_indices] = False
+
+        # Filter names
+        filtered_names = [name for i, name in enumerate(names) if keep_mask[i]]
+
+        # Filter animation data
+        filtered_rotations = animation.rotations[:, keep_mask, :]
+        filtered_positions = animation.positions[:, keep_mask, :]
+        filtered_orients = Quaternions(animation.orients.qs[keep_mask])
+        filtered_offsets = animation.offsets[keep_mask]
+
+        # Update parents array
+        filtered_parents = animation.parents.copy()
+        # Create mapping from old indices to new indices
+        old_to_new = {old_idx: new_idx for new_idx, old_idx in enumerate(np.where(keep_mask)[0])}
+
+        # Update parent references
+        for i in range(len(filtered_parents)):
+            if filtered_parents[i] != -1:
+                filtered_parents[i] = old_to_new.get(filtered_parents[i], -1)
+
+        # Only keep parents for joints that are being kept
+        filtered_parents = filtered_parents[keep_mask]
+
+        # Create new animation object
+        filtered_animation = Animation(
+            filtered_rotations,
+            filtered_positions,
+            filtered_orients,
+            filtered_offsets,
+            filtered_parents
+        )
+
+        return filtered_animation, filtered_names
 
     def _build_joint_tree(self, animation: Animation, names: list) -> SkeletonJoint:
         """
