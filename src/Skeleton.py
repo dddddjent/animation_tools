@@ -65,8 +65,8 @@ class Skeleton:
 
         # TODO: fix the skeleton, ignore for now
 
-        # TODO: Label the skeleton
         self._label_skeleton()
+        self.default_orientation = self.guess_orientations()
 
     @staticmethod
     def load(filename):
@@ -263,13 +263,15 @@ class Skeleton:
                 elif any(k in name_l for k in ["right", "r_"]):
                     right_candidate = child
             # Fallbacks if names are ambiguous: use offsets X to disambiguate if available
-            missing = [x is None for x in [head_candidate, left_candidate, right_candidate]]
+            missing = [x is None for x in [
+                head_candidate, left_candidate, right_candidate]]
             if any(missing):
                 # Sort by x offset sign: left has x>0 for many rigs, right x<0; head y> others
                 # Use absolute heuristics carefully; fallback to arbitrary but consistent ordering
                 sorted_children = sorted(
                     chest.children,
-                    key=lambda j: (-(j.offset[1] if hasattr(j.offset, '__iter__') else 0.0), j.offset[0]),
+                    key=lambda j: (-(j.offset[1] if hasattr(j.offset,
+                                   '__iter__') else 0.0), j.offset[0]),
                 )
                 # Highest Y likely head
                 head_candidate = head_candidate or sorted_children[0]
@@ -373,7 +375,8 @@ class Skeleton:
 
         # Arms and head from chest
         if len(chest.children) == 3:
-            head_node, left_arm_root, right_arm_root = collect_limbs_from_chest(chest)
+            head_node, left_arm_root, right_arm_root = collect_limbs_from_chest(
+                chest)
             if head_node is not None:
                 head_nodes = traverse_branch_until_end(head_node)
                 assign_label_to_group(head_nodes, "Head")
@@ -383,3 +386,126 @@ class Skeleton:
             if right_arm_root is not None:
                 right_arm_nodes = traverse_branch_until_end(right_arm_root)
                 assign_label_to_group(right_arm_nodes, "RightArm")
+
+    def guess_orientations(self) -> dict[str, str]:
+        """
+        Guess the orientations of the skeleton.
+        Returns: {"forward": 'x', "up": 'y}
+        It can be x, y, z, or -x, -y, -z.
+        """
+        # We need 2 vectors, the spine and left end to right end (not necessarily the hands)
+        # The spine determines the up direction. the other vector and up determine the forward direction.
+
+        def find_joints_by_label(label: str) -> list[SkeletonJoint]:
+            """Find all joints with a specific body part label."""
+            joints = []
+
+            def traverse(node: SkeletonJoint):
+                if hasattr(node, 'body_part_label') and node.body_part_label == label:
+                    joints.append(node)
+                for child in node.children:
+                    traverse(child)
+
+            if self.skeleton:
+                traverse(self.skeleton)
+            return joints
+
+        def get_joint_world_position(joint: SkeletonJoint) -> np.ndarray:
+            """Calculate the world position of a joint by accumulating offsets."""
+            position = np.zeros(3)
+            current = joint
+            while current:
+                position += current.offset
+                current = current.parent
+            return position
+
+        def vector_to_axis_name(vector: np.ndarray) -> str:
+            """Convert a direction vector to the closest axis name."""
+            # Normalize the vector
+            vector = vector / np.linalg.norm(vector)
+
+            # Find the axis with maximum absolute component
+            abs_components = np.abs(vector)
+            max_idx = np.argmax(abs_components)
+
+            # Determine if it's positive or negative
+            sign = '-' if vector[max_idx] < 0 else ''
+            axis_names = ['x', 'y', 'z']
+            return f"{sign}{axis_names[max_idx]}"
+
+        # Find spine joints to determine up direction
+        spine_joints = find_joints_by_label("Spine")
+        if not spine_joints:
+            return {"forward": "x", "up": "y"}  # fallback
+
+        # Calculate spine direction (from bottom to top)
+        if len(spine_joints) >= 2:
+            # Use the bottom and top spine joints
+            spine_bottom = min(spine_joints, key=lambda j: get_joint_world_position(j)[1])
+            spine_top = max(spine_joints, key=lambda j: get_joint_world_position(j)[1])
+            spine_vector = get_joint_world_position(spine_top) - get_joint_world_position(spine_bottom)
+        else:
+            # Use the single spine joint's offset as direction
+            spine_vector = spine_joints[0].offset
+
+        # Determine up direction from spine
+        up_axis = vector_to_axis_name(spine_vector)
+
+        # Find left and right endpoints for forward direction
+        # Try arms first, then legs
+        left_endpoints = []
+        right_endpoints = []
+
+        # Check arms
+        left_arm_joints = find_joints_by_label("LeftArm")
+        right_arm_joints = find_joints_by_label("RightArm")
+
+        if left_arm_joints and right_arm_joints:
+            # Use the farthest joints in each arm (typically hands/wrists)
+            left_endpoints = [max(left_arm_joints, key=lambda j: np.linalg.norm(get_joint_world_position(j)))]
+            right_endpoints = [max(right_arm_joints, key=lambda j: np.linalg.norm(get_joint_world_position(j)))]
+        else:
+            # Fall back to legs
+            left_leg_joints = find_joints_by_label("LeftLeg")
+            right_leg_joints = find_joints_by_label("RightLeg")
+
+            if left_leg_joints and right_leg_joints:
+                # Use the farthest joints in each leg (typically feet/toes)
+                left_endpoints = [max(left_leg_joints, key=lambda j: np.linalg.norm(get_joint_world_position(j)))]
+                right_endpoints = [max(right_leg_joints, key=lambda j: np.linalg.norm(get_joint_world_position(j)))]
+
+        if left_endpoints and right_endpoints:
+            # Calculate left-to-right vector
+            left_pos = get_joint_world_position(left_endpoints[0])
+            right_pos = get_joint_world_position(right_endpoints[0])
+            left_right_vector = right_pos - left_pos
+
+            # Convert up_axis to a vector for cross product calculation
+            up_components = {'x': 0, 'y': 1, 'z': 2, '-x': 0, '-y': 1, '-z': 2}
+            up_axis_clean = up_axis.lstrip('-')
+            up_idx = up_components[up_axis_clean]
+            up_vector = np.zeros(3)
+            up_vector[up_idx] = 1 if not up_axis.startswith('-') else -1
+
+            # Calculate forward direction as cross product of up and left-right vectors
+            # This gives us a direction perpendicular to both up and left-right
+            forward_vector = np.cross(up_vector, left_right_vector)
+
+            # If forward vector is zero (vectors are parallel), fall back to projection method
+            if np.linalg.norm(forward_vector) < 1e-6:
+                # Zero out the up component to get forward direction
+                forward_vector = left_right_vector.copy()
+                forward_vector[up_idx] = 0
+                # If still zero, use the original left-right vector
+                if np.linalg.norm(forward_vector) < 1e-6:
+                    forward_vector = left_right_vector
+
+            forward_axis = vector_to_axis_name(forward_vector)
+        else:
+            # If no suitable endpoints found, use a default forward direction
+            # perpendicular to the up direction
+            up_idx = up_components[up_axis.lstrip('-')]
+            available_axes = [i for i in range(3) if i != up_idx]
+            forward_axis = ['x', 'y', 'z'][available_axes[0]]
+
+        return {"forward": forward_axis, "up": up_axis}
