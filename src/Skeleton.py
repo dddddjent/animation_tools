@@ -817,4 +817,118 @@ class Skeleton:
             transform_joint_offsets(self.skeleton)
 
     def get_height(self) -> float:
-        pass
+        """
+        Calculate the height of the skeleton according to its orientation.
+
+        Returns
+        -------
+        float
+            The height of the skeleton in the direction of the up axis
+        """
+        if not self.skeleton:
+            return 0.0
+
+        # Get the up axis from orientation
+        up_axis = self.orientation.get('up', 'y')
+
+        # Map axis string to index
+        axis_map = {'x': 0, 'y': 1, 'z': 2, '-x': 0, '-y': 1, '-z': 2}
+        axis_idx = axis_map.get(up_axis.lstrip('-'), 1)  # default to y
+        axis_sign = -1 if up_axis.startswith('-') else 1
+
+        # Function to calculate world position of a joint
+        def get_joint_world_position(joint: SkeletonJoint) -> np.ndarray:
+            position = np.zeros(3)
+            current = joint
+            while current:
+                position += np.asarray(current.offset).flatten()
+                current = current.parent
+            return position
+
+        # Collect all joints
+        all_joints = []
+
+        def collect_joints(joint: SkeletonJoint):
+            all_joints.append(joint)
+            for child in joint.children:
+                collect_joints(child)
+
+        collect_joints(self.skeleton)
+
+        if not all_joints:
+            return 0.0
+
+        # Find min and max positions along the up axis
+        min_height = float('inf')
+        max_height = float('-inf')
+
+        for joint in all_joints:
+            world_pos = get_joint_world_position(joint)
+            height_component = world_pos[axis_idx] * axis_sign
+            min_height = min(min_height, height_component)
+            max_height = max(max_height, height_component)
+
+        # Height is the difference between max and min
+        return max_height - min_height
+
+    def get_height_from_hips_to_bottom(self) -> float:
+        """
+        Calculate the height from the hips (root) to the bottom (lowest foot or joint).
+
+        Returns
+        -------
+        float
+            The height from hips to the lowest joint in the direction of the up axis
+        """
+        if not self.skeleton:
+            return 0.0
+
+        # Get the up axis from orientation
+        up_axis = self.orientation.get('up', 'y')
+
+        # Map axis string to index
+        axis_map = {'x': 0, 'y': 1, 'z': 2, '-x': 0, '-y': 1, '-z': 2}
+        axis_idx = axis_map.get(up_axis.lstrip('-'), 1)  # default to y
+        axis_sign = -1 if up_axis.startswith('-') else 1
+
+        # Function to calculate world position of a joint
+        def get_joint_world_position(joint: SkeletonJoint) -> np.ndarray:
+            position = np.zeros(3)
+            current = joint
+            while current:
+                position += np.asarray(current.offset).flatten()
+                current = current.parent
+            return position
+
+        # Get root (hips) position
+        root_position = get_joint_world_position(self.skeleton)
+        root_height_component = root_position[axis_idx] * axis_sign
+
+        # Collect all joints to find the lowest one
+        all_joints = []
+
+        def collect_joints(joint: SkeletonJoint):
+            all_joints.append(joint)
+            for child in joint.children:
+                collect_joints(child)
+
+        collect_joints(self.skeleton)
+
+        if not all_joints:
+            return 0.0
+
+        # Find the lowest joint along the up axis
+        min_height_component = float('inf')
+        lowest_joint = None
+
+        for joint in all_joints:
+            world_pos = get_joint_world_position(joint)
+            height_component = world_pos[axis_idx] * axis_sign
+            if height_component < min_height_component:
+                min_height_component = height_component
+                lowest_joint = joint
+
+        # Calculate height difference (positive value)
+        height_from_hips_to_bottom = root_height_component - min_height_component
+
+        return max(0.0, height_from_hips_to_bottom)  # Ensure non-negative result
