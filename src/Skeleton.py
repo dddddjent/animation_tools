@@ -597,7 +597,7 @@ class Skeleton:
             position = np.zeros(3)
             current = joint
             while current:
-                position += current.offset
+                position += np.asarray(current.offset).flatten()
                 current = current.parent
             return position
 
@@ -692,3 +692,129 @@ class Skeleton:
             forward_axis = ['x', 'y', 'z'][available_axes[0]]
 
         return {"forward": forward_axis, "up": up_axis}
+
+    def align_orientation(self, new_orientation: dict[str, str]):
+        """
+        Align the skeleton to a new orientation by transforming bone directions,
+        rotations, and root translations.
+
+        Parameters
+        ----------
+        new_orientation : dict[str, str]
+            Dictionary specifying the new forward and up axes, e.g., {"forward": "x", "up": "y"}
+            Values can be "x", "y", "z", "-x", "-y", "-z"
+        """
+        if not self.skeleton:
+            return
+
+        # Get current orientation
+        current_orientation = self.default_orientation
+
+        # Calculate transformation quaternion from current to new orientation
+        transform_quat = self._calculate_orientation_transform(current_orientation, new_orientation)
+
+        # Apply transformation to all components
+        self._transform_root_positions(transform_quat)
+        self._transform_all_rotations(transform_quat)
+        self._transform_all_offsets(transform_quat)
+
+        # Update default orientation
+        self.default_orientation = new_orientation.copy()
+
+    def _calculate_orientation_transform(self, current_orientation: dict[str, str],
+                                        new_orientation: dict[str, str]) -> Quaternions:
+        """
+        Calculate the quaternion transformation from current to new orientation.
+        """
+        # Convert axis strings to unit vectors
+        def axis_to_vector(axis: str) -> np.ndarray:
+            vectors = {
+                'x': np.array([1, 0, 0]), '-x': np.array([-1, 0, 0]),
+                'y': np.array([0, 1, 0]), '-y': np.array([0, -1, 0]),
+                'z': np.array([0, 0, 1]), '-z': np.array([0, 0, -1])
+            }
+            return vectors[axis]
+
+        def normalize(v: np.ndarray) -> np.ndarray:
+            n = np.linalg.norm(v)
+            if n < 1e-8:
+                return v
+            return v / n
+
+        def build_basis(forward: np.ndarray, up: np.ndarray) -> np.ndarray:
+            # Orthonormal, right-handed basis: [right, up, forward]
+            up_n = normalize(up)
+            f_n = normalize(forward)
+            right = normalize(np.cross(up_n, f_n))
+            # Recompute forward to ensure orthogonality
+            forward_ortho = normalize(np.cross(right, up_n))
+            basis = np.column_stack([right, up_n, forward_ortho])
+            return basis
+
+        # Get current coordinate system vectors
+        current_forward = axis_to_vector(current_orientation['forward'])
+        current_up = axis_to_vector(current_orientation['up'])
+
+        # Get new coordinate system vectors
+        new_forward = axis_to_vector(new_orientation['forward'])
+        new_up = axis_to_vector(new_orientation['up'])
+
+        # Build orthonormal right-handed bases
+        current_basis = build_basis(current_forward, current_up)
+        new_basis = build_basis(new_forward, new_up)
+
+        # Calculate transformation matrix (active rotation mapping current -> new)
+        # For orthonormal bases, inverse is transpose
+        transform_matrix = new_basis @ current_basis.T
+
+        # Check if this is essentially an identity transformation
+        if np.allclose(transform_matrix, np.eye(3), atol=1e-6):
+            # Return identity quaternion
+            return Quaternions.identity()
+
+        # Convert to quaternion
+        transform_quat = Quaternions.from_transforms(transform_matrix.reshape(1, 3, 3))
+
+        return transform_quat
+
+    def _transform_root_positions(self, transform_quat: Quaternions):
+        """Apply transformation to root joint positions/translations."""
+        if self.skeleton and self.skeleton.positions.size > 0:
+            # Transform positions for each frame
+            self.skeleton.positions = transform_quat * self.skeleton.positions
+
+    def _transform_all_rotations(self, transform_quat: Quaternions):
+        """Apply transformation to all joint rotations."""
+        # Calculate inverse transformation for rotations
+        transform_quat_inv = -transform_quat
+
+        def transform_joint_rotations(joint: SkeletonJoint):
+            if joint.rotations.qs.size > 0:
+                # For coordinate system transformation, we need to apply:
+                # new_rotation = transform_quat * old_rotation * transform_quat_inv
+                joint.rotations = transform_quat * joint.rotations * transform_quat_inv
+
+            # Recursively transform children
+            for child in joint.children:
+                transform_joint_rotations(child)
+
+        if self.skeleton:
+            transform_joint_rotations(self.skeleton)
+
+    def _transform_all_offsets(self, transform_quat: Quaternions):
+        """Apply transformation to joint offsets to align bone directions."""
+        def transform_joint_offsets(joint: SkeletonJoint):
+            if joint.offset.size > 0:
+                # Transform offset vector
+                transformed_offset = transform_quat * joint.offset
+                joint.offset = transformed_offset
+
+            # Recursively transform children
+            for child in joint.children:
+                transform_joint_offsets(child)
+
+        if self.skeleton:
+            transform_joint_offsets(self.skeleton)
+
+    def get_height(self) -> float:
+        pass
