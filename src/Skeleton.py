@@ -232,9 +232,11 @@ class Skeleton:
 
             # Reassign children to parent
             for child in children_to_reassign:
-                parent.add_child(child)
+                # Transfer the removed joint's rotation to the child
+                child.rotations = joint.rotations * child.rotations
                 # Update child's offset to be relative to new parent
                 child.offset = joint.offset + child.offset
+                parent.add_child(child)
 
         def traverse_and_remove(joint: SkeletonJoint):
             """Recursively traverse and remove unwanted joints."""
@@ -289,8 +291,25 @@ class Skeleton:
             if is_hips_like or has_multiple_children:
                 print(f"Removing redundant root '{root.name}' and moving motion to '{child.name}'")
 
-                # Transfer root motion to child
-                child.positions = root.positions.copy()
+                # Check if root has meaningful translation (not all zeros)
+                root_has_translation = root.positions.size > 0 and not np.allclose(root.positions, 0)
+
+                # Only transfer root motion if it has meaningful translation
+                if root_has_translation:
+                    child.positions = root.positions.copy()
+                    # Add child's own offset to maintain correct world positioning
+                    child.positions = child.positions + child.offset
+                else:
+                    # If root has no translation, keep child's original positions
+                    # but still add child's offset to maintain rest pose relationship
+                    if child.positions.size == 0:
+                        # If child has no positions, create positions array with child's offset
+                        num_frames = child.rotations.qs.shape[0] if hasattr(child.rotations, 'qs') else 0
+                        if num_frames > 0:
+                            child.positions = np.tile(child.offset, (num_frames, 1))
+                    else:
+                        # If child has positions, add child's offset
+                        child.positions = child.positions + child.offset
 
                 # Update child's offset to include root's offset
                 child.offset = root.offset + child.offset
@@ -299,12 +318,12 @@ class Skeleton:
                 child.parent = None
                 self.skeleton = child
 
-                # The child should no longer have any rotation data if it was
-                # just a structural joint - root motion should handle positioning
+                # Transfer the root's rotation to the child
+                # The root's rotation should be combined with the child's rotation
                 if root.rotations.qs.shape == child.rotations.qs.shape:
-                    # If rotations are the same shape, assume child should be identity rotation
-                    # since motion is now handled by positions
-                    child.rotations = Quaternions.id(child.rotations.qs.shape[0])
+                    # Combine root rotation with child rotation
+                    child.rotations = root.rotations * child.rotations
+                # If shapes don't match, keep child's original rotation
 
     def store(self, filename: str, order: str = 'zyx', save_positions: bool = False) -> None:
         """
