@@ -63,8 +63,8 @@ class Skeleton:
         # Build the joint tree
         self.skeleton = self._build_joint_tree(animation, names)
 
-        # TODO: fix the skeleton, ignore for now
-
+        self.remove_unwanted_joints()
+        self.remove_redundant_root()
         self._label_skeleton()
         self.default_orientation = self.guess_orientations()
 
@@ -142,6 +142,169 @@ class Skeleton:
                 parent_joint.add_child(child_joint)
 
         return root_joint
+
+    def remove_unwanted_joints(self):
+        """
+        Remove unwanted joints from the skeleton.
+
+        Unwanted joints include:
+        - fingers
+        - Jaw
+        - eyes
+        - toe (but toe base is preserved)
+
+        Joints are identified by:
+        1. Name matching unwanted patterns
+        2. Structural analysis (joints with too many children, indicating finger branches)
+        """
+        if not self.skeleton:
+            return
+
+        # Define patterns for unwanted joints
+        unwanted_patterns = [
+            # Finger patterns
+            'finger', 'thumb', 'index', 'middle', 'ring', 'pinky', 'fingers',
+            # Jaw patterns
+            'jaw', 'mouth', 'teeth',
+            # Eye patterns
+            'eye', 'eyelid', 'eyebrow', 'pupil', 'cornea',
+            # Toe patterns (but preserve toe base)
+            'toe_tip', 'toe_end', 'toe_distal', 'toe1', 'toe2', 'toe3', 'toe4', 'toe5',
+            # Additional finger/toe patterns
+            'fing', 'phalange', 'digit', 'metacarpal',
+            # Face patterns that might include eyes/jaw
+            'face', 'facial'
+        ]
+
+        def is_unwanted_by_name(name: str) -> bool:
+            """Check if joint name matches unwanted patterns."""
+            name_lower = name.lower()
+            # Check for unwanted patterns
+            for pattern in unwanted_patterns:
+                if pattern in name_lower:
+                    return True
+            # Special case: toe but not toe base
+            if 'toe' in name_lower and 'base' not in name_lower:
+                return True
+            return False
+
+        def has_too_many_children(joint: SkeletonJoint) -> bool:
+            """Check if joint has too many children (indicating finger branches)."""
+            # Normal limb joints usually have 0 or 1 child (end effector)
+            # If a joint has 3+ children, it's likely a finger branching point
+            return len(joint.children) >= 3
+
+        def should_remove_joint(joint: SkeletonJoint) -> bool:
+            """Determine if a joint should be removed."""
+            # Check by name
+            if is_unwanted_by_name(joint.name):
+                return True
+
+            # Check by structure (too many children)
+            if has_too_many_children(joint):
+                # Additional check: only remove if it looks like a finger joint
+                # Check if children have finger-like names
+                finger_like_children = 0
+                for child in joint.children:
+                    child_name_lower = child.name.lower()
+                    if any(pattern in child_name_lower for pattern in
+                          ['finger', 'thumb', 'index', 'middle', 'ring', 'pinky', 'phalange', 'digit']):
+                        finger_like_children += 1
+
+                # If majority of children are finger-like, remove this joint
+                if finger_like_children >= len(joint.children) / 2:
+                    return True
+
+            return False
+
+        def remove_joint(joint: SkeletonJoint):
+            """Remove a joint and reassign its children to its parent."""
+            if not joint.parent:
+                return  # Don't remove root joint
+
+            parent = joint.parent
+
+            # Collect children to reassign
+            children_to_reassign = joint.children.copy()
+
+            # Remove joint from parent's children
+            parent.remove_child(joint)
+
+            # Reassign children to parent
+            for child in children_to_reassign:
+                parent.add_child(child)
+                # Update child's offset to be relative to new parent
+                child.offset = joint.offset + child.offset
+
+        def traverse_and_remove(joint: SkeletonJoint):
+            """Recursively traverse and remove unwanted joints."""
+            if not joint:
+                return
+
+            # First, process children recursively (post-order traversal)
+            # We need to copy the children list because it might be modified
+            children_copy = joint.children.copy()
+            for child in children_copy:
+                traverse_and_remove(child)
+
+            # Then check if current joint should be removed
+            if should_remove_joint(joint):
+                remove_joint(joint)
+
+        # Start removal from root
+        traverse_and_remove(self.skeleton)
+
+    def remove_redundant_root(self):
+        """
+        Remove redundant root joint above hips and transfer its motion to hips.
+
+        This method identifies cases where there's an unwanted root joint above the hips
+        and removes it, transferring any root motion data to the hips joint.
+        """
+        if not self.skeleton:
+            return
+
+        root = self.skeleton
+
+        # Check if this looks like a redundant root scenario:
+        # 1. Root has only one child
+        # 2. The child is likely a hips/lower body joint
+        # 3. Root has position data (motion) and the child doesn't
+
+        if (len(root.children) == 1 and
+            root.positions.size > 0 and
+            root.children[0].positions.size == 0):
+
+            child = root.children[0]
+
+            # Check if the child looks like hips based on name or structure
+            child_name = child.name.lower()
+            is_hips_like = any(keyword in child_name for keyword in [
+                'hip', 'hips', 'pelvis', 'spine', 'torso', 'root'
+            ])
+
+            # Also check if child has multiple children (typical for hips)
+            has_multiple_children = len(child.children) >= 2
+
+            if is_hips_like or has_multiple_children:
+                print(f"Removing redundant root '{root.name}' and moving motion to '{child.name}'")
+
+                # Transfer root motion to child
+                child.positions = root.positions.copy()
+
+                # Update child's offset to include root's offset
+                child.offset = root.offset + child.offset
+
+                # Make child the new root
+                child.parent = None
+                self.skeleton = child
+
+                # The child should no longer have any rotation data if it was
+                # just a structural joint - root motion should handle positioning
+                if root.rotations.qs.shape == child.rotations.qs.shape:
+                    # If rotations are the same shape, assume child should be identity rotation
+                    # since motion is now handled by positions
+                    child.rotations = Quaternions.id(child.rotations.qs.shape[0])
 
     def store(self, filename: str, order: str = 'zyx', save_positions: bool = False) -> None:
         """
@@ -474,14 +637,15 @@ class Skeleton:
                 left_endpoints = [max(left_leg_joints, key=lambda j: np.linalg.norm(get_joint_world_position(j)))]
                 right_endpoints = [max(right_leg_joints, key=lambda j: np.linalg.norm(get_joint_world_position(j)))]
 
+        # Convert up_axis to a vector for cross product calculation
+        up_components = {'x': 0, 'y': 1, 'z': 2, '-x': 0, '-y': 1, '-z': 2}
+
         if left_endpoints and right_endpoints:
             # Calculate left-to-right vector
             left_pos = get_joint_world_position(left_endpoints[0])
             right_pos = get_joint_world_position(right_endpoints[0])
             left_right_vector = right_pos - left_pos
 
-            # Convert up_axis to a vector for cross product calculation
-            up_components = {'x': 0, 'y': 1, 'z': 2, '-x': 0, '-y': 1, '-z': 2}
             up_axis_clean = up_axis.lstrip('-')
             up_idx = up_components[up_axis_clean]
             up_vector = np.zeros(3)
