@@ -38,6 +38,9 @@ class SkeletonJoint:
         self.offset = offset
         self.rotations = rotations
         self.positions = positions
+        # Assigned canonical body part label, e.g., "Spine", "LeftLeg".
+        # Left as None until labeling is performed by Skeleton._label_skeleton().
+        self.body_part_label: str | None = None
 
     def add_child(self, child: "SkeletonJoint") -> None:
         """Add a child joint to this joint.
@@ -74,6 +77,8 @@ class SkeletonJoint:
         parent_name = f'"{self.parent.name}"' if self.parent else 'null'
         lines.append(f"{next_indent_str}\"parent\": {parent_name},")
         lines.append(f"{next_indent_str}\"offset\": [{', '.join(f'{x:.3f}' for x in self.offset)}],")
+        body_label = f'"{self.body_part_label}"' if self.body_part_label is not None else 'null'
+        lines.append(f"{next_indent_str}\"body_part_label\": {body_label},")
         
         if self.children:
             lines.append(f"{next_indent_str}\"children\": [")

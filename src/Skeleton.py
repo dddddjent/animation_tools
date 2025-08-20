@@ -13,6 +13,38 @@ class Skeleton:
     This class can be initialized with the returns from BVH.load() function.
     """
 
+    # Maps a canonical body label to an unordered set of possible names/aliases
+    # that may appear in various skeleton sources (e.g., BVH exports)
+    body_label_map: dict[str, set[str]] = {
+        "RightArm": {
+            "RightArm", "right_arm", "RightForearm", "RightForeArm", "RightHand",
+            "RArm", "RForeArm", "RHand", "RightWrist", "RWrist", "RightElbow", "RElbow",
+            "right_hand", "right_forearm", "right_elbow", "right_wrist"
+        },
+        "LeftArm": {
+            "LeftArm", "left_arm", "LeftForearm", "LeftForeArm", "LeftHand",
+            "LArm", "LForeArm", "LHand", "LeftWrist", "LWrist", "LeftElbow", "LElbow",
+            "left_hand", "left_forearm", "left_elbow", "left_wrist"
+        },
+        "Head": {
+            "Head", "head", "HEAD", "HeadTop", "HeadTop_End", "Neck", "neck"
+        },
+        "Spine": {
+            "Spine", "spine", "Spine1", "Spine2", "Spine3", "Spine4",
+            "Spine01", "Chest", "UpperChest", "Torso", "Hips", "hips"
+        },
+        "RightLeg": {
+            "RightLeg", "right_leg", "RightUpLeg", "RightThigh", "RightFoot",
+            "RightToeBase", "RLeg", "RUpLeg", "RThigh", "RFoot", "RToeBase", "RightAnkle", "RAnkle",
+            "right_foot", "right_thigh", "right_leg", "right_ankle", "right_toe"
+        },
+        "LeftLeg": {
+            "LeftLeg", "left_leg", "LeftUpLeg", "LeftThigh", "LeftFoot",
+            "LeftToeBase", "LLeg", "LUpLeg", "LThigh", "LFoot", "LToeBase", "LeftAnkle", "LAnkle",
+            "left_foot", "left_thigh", "left_leg", "left_ankle", "left_toe"
+        },
+    }
+
     def __init__(self, animation: Animation, names: list, frametime: float):
         """
         Initialize the Skeleton with data from BVH.load().
@@ -30,6 +62,11 @@ class Skeleton:
 
         # Build the joint tree
         self.skeleton = self._build_joint_tree(animation, names)
+
+        # TODO: fix the skeleton, ignore for now
+
+        # TODO: Label the skeleton
+        self._label_skeleton()
 
     @staticmethod
     def load(filename):
@@ -167,3 +204,182 @@ class Skeleton:
             positions=save_positions,
             orients=True,
         )
+
+    def _label_skeleton(self):
+        """
+        Label the skeleton with the body_label_map.
+        """
+        # Build fast alias->canonical map
+        alias_to_canonical: dict[str, str] = {}
+        for canonical, aliases in self.body_label_map.items():
+            for alias in aliases:
+                alias_to_canonical[alias.lower()] = canonical
+
+        def find_spine_path_from_root(root: SkeletonJoint) -> list[SkeletonJoint]:
+            # Find a path from root through successive single-child joints up to
+            # the first joint that has exactly 3 children (the chest)
+            path: list[SkeletonJoint] = [root]
+            current = root
+            # We need to ignore root's 3 children rule; root often has 3 children (hips)
+            while True:
+                children = current.children
+                if not children:
+                    break
+                if len(children) == 1:
+                    current = children[0]
+                    path.append(current)
+                    continue
+                if len(children) == 3 and current is not root:
+                    # We reached the chest-like branching
+                    break
+                # If there are 2 or more but not the branching we want, choose the child whose
+                # name best resembles spine/hips
+                preferred = None
+                for child in children:
+                    name_l = child.name.lower()
+                    if any(k in name_l for k in ["spine", "hip", "hips", "pelvis", "torso", "chest"]):
+                        preferred = child
+                        break
+                if preferred is None:
+                    # fallback: choose first to avoid getting stuck
+                    preferred = children[0]
+                current = preferred
+                path.append(current)
+            return path
+
+        def collect_limbs_from_chest(chest: SkeletonJoint) -> tuple[SkeletonJoint, SkeletonJoint, SkeletonJoint]:
+            # chest is the first joint with exactly 3 children after spine
+            # We must decide which is head, left arm, right arm by name heuristics.
+            assert len(chest.children) == 3
+            head_candidate = None
+            left_candidate = None
+            right_candidate = None
+            for child in chest.children:
+                name_l = child.name.lower()
+                if any(k in name_l for k in ["head", "neck"]):
+                    head_candidate = child
+                elif any(k in name_l for k in ["left", "l_"]):
+                    left_candidate = child
+                elif any(k in name_l for k in ["right", "r_"]):
+                    right_candidate = child
+            # Fallbacks if names are ambiguous: use offsets X to disambiguate if available
+            missing = [x is None for x in [head_candidate, left_candidate, right_candidate]]
+            if any(missing):
+                # Sort by x offset sign: left has x>0 for many rigs, right x<0; head y> others
+                # Use absolute heuristics carefully; fallback to arbitrary but consistent ordering
+                sorted_children = sorted(
+                    chest.children,
+                    key=lambda j: (-(j.offset[1] if hasattr(j.offset, '__iter__') else 0.0), j.offset[0]),
+                )
+                # Highest Y likely head
+                head_candidate = head_candidate or sorted_children[0]
+                rem = [c for c in chest.children if c is not head_candidate]
+                if len(rem) == 2:
+                    if rem[0].offset[0] >= rem[1].offset[0]:
+                        left_candidate = left_candidate or rem[0]
+                        right_candidate = right_candidate or rem[1]
+                    else:
+                        left_candidate = left_candidate or rem[1]
+                        right_candidate = right_candidate or rem[0]
+                else:
+                    # If structure is unexpected, assign arbitrarily
+                    for c in rem:
+                        if left_candidate is None:
+                            left_candidate = c
+                        elif right_candidate is None:
+                            right_candidate = c
+            return head_candidate, left_candidate, right_candidate
+
+        def traverse_chain_down(joint: SkeletonJoint) -> list[SkeletonJoint]:
+            # Follow the longest single-child path until termination or split
+            chain = [joint]
+            current = joint
+            while True:
+                if not current.children:
+                    break
+                if len(current.children) != 1:
+                    # stop at branching
+                    break
+                current = current.children[0]
+                chain.append(current)
+            return chain
+
+        def traverse_branch_until_end(joint: SkeletonJoint) -> list[SkeletonJoint]:
+            # Depth-first collect until leaves
+            nodes = []
+            stack = [joint]
+            while stack:
+                node = stack.pop()
+                nodes.append(node)
+                for c in node.children:
+                    stack.append(c)
+            return nodes
+
+        def assign_label_to_group(joints: list[SkeletonJoint], default_canonical: str) -> None:
+            # If any joint in the group matches an alias, use that canonical key; else use default
+            canonical = default_canonical
+            for j in joints:
+                name_l = j.name.lower()
+                if name_l in alias_to_canonical:
+                    canonical = alias_to_canonical[name_l]
+                    break
+            for j in joints:
+                j.body_part_label = canonical
+
+        root = self.skeleton
+        if root is None:
+            return
+
+        # Find spine path from root to first branching (3-children) after root
+        spine_path = find_spine_path_from_root(root)
+        # The chest is the last in path if it has 3 children; otherwise try to find next node with 3 children
+        chest = spine_path[-1]
+        if len(chest.children) != 3:
+            # Search below for the first node with 3 children
+            candidates = traverse_branch_until_end(chest)
+            for n in candidates:
+                if len(n.children) == 3:
+                    chest = n
+                    break
+
+        # Assign spine label (including hips/root)
+        assign_label_to_group(spine_path, "Spine")
+
+        # Legs: from hips/root, two branches that end with feet/toes
+        leg_candidates = [c for c in root.children if c not in spine_path]
+        # If root is hips and has 3 children, two non-spine branches are legs
+        legs = []
+        for c in leg_candidates:
+            # Heuristic: choose branches that go downward in Y first segment
+            if c is chest:
+                continue
+            legs.append(c)
+        if len(legs) > 2 and chest in legs:
+            legs.remove(chest)
+        legs = legs[:2]
+
+        if len(legs) == 2:
+            left_leg_root, right_leg_root = None, None
+            # Decide left/right by x offset of first joint
+            if legs[0].offset[0] >= legs[1].offset[0]:
+                left_leg_root, right_leg_root = legs[0], legs[1]
+            else:
+                left_leg_root, right_leg_root = legs[1], legs[0]
+
+            left_leg_nodes = traverse_branch_until_end(left_leg_root)
+            right_leg_nodes = traverse_branch_until_end(right_leg_root)
+            assign_label_to_group(left_leg_nodes, "LeftLeg")
+            assign_label_to_group(right_leg_nodes, "RightLeg")
+
+        # Arms and head from chest
+        if len(chest.children) == 3:
+            head_node, left_arm_root, right_arm_root = collect_limbs_from_chest(chest)
+            if head_node is not None:
+                head_nodes = traverse_branch_until_end(head_node)
+                assign_label_to_group(head_nodes, "Head")
+            if left_arm_root is not None:
+                left_arm_nodes = traverse_branch_until_end(left_arm_root)
+                assign_label_to_group(left_arm_nodes, "LeftArm")
+            if right_arm_root is not None:
+                right_arm_nodes = traverse_branch_until_end(right_arm_root)
+                assign_label_to_group(right_arm_nodes, "RightArm")
