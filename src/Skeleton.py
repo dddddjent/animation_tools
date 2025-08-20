@@ -66,7 +66,7 @@ class Skeleton:
         self.remove_unwanted_joints()
         self.remove_redundant_root()
         self._label_skeleton()
-        self.default_orientation = self.guess_orientations()
+        self.orientation = self.guess_orientations()
 
     @staticmethod
     def load(filename):
@@ -708,7 +708,7 @@ class Skeleton:
             return
 
         # Get current orientation
-        current_orientation = self.default_orientation
+        current_orientation = self.orientation
 
         # Calculate transformation quaternion from current to new orientation
         transform_quat = self._calculate_orientation_transform(current_orientation, new_orientation)
@@ -719,7 +719,7 @@ class Skeleton:
         self._transform_all_offsets(transform_quat)
 
         # Update default orientation
-        self.default_orientation = new_orientation.copy()
+        self.orientation = new_orientation.copy()
 
     def _calculate_orientation_transform(self, current_orientation: dict[str, str],
                                         new_orientation: dict[str, str]) -> Quaternions:
