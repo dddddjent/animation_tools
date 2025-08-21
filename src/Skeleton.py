@@ -419,81 +419,109 @@ class Skeleton:
             for alias in aliases:
                 alias_to_canonical[alias.lower()] = canonical
 
-        def find_spine_path_from_root(root: SkeletonJoint) -> list[SkeletonJoint]:
-            # Find a path from root through successive single-child joints up to
-            # the first joint that has exactly 3 children (the chest)
-            path: list[SkeletonJoint] = [root]
-            current = root
-            # We need to ignore root's 3 children rule; root often has 3 children (hips)
-            while True:
-                children = current.children
-                if not children:
-                    break
-                if len(children) == 1:
-                    current = children[0]
-                    path.append(current)
-                    continue
-                if len(children) == 3 and current is not root:
-                    # We reached the chest-like branching
-                    break
-                # If there are 2 or more but not the branching we want, choose the child whose
-                # name best resembles spine/hips
-                preferred = None
-                for child in children:
-                    name_l = child.name.lower()
-                    if any(k in name_l for k in ["spine", "hip", "hips", "pelvis", "torso", "chest"]):
-                        preferred = child
-                        break
-                if preferred is None:
-                    # fallback: choose first to avoid getting stuck
-                    preferred = children[0]
-                current = preferred
-                path.append(current)
-            return path
+        def get_joint_world_position(joint: SkeletonJoint) -> np.ndarray:
+            pos = np.zeros(3)
+            cur = joint
+            while cur is not None:
+                pos += np.asarray(cur.offset).flatten()
+                cur = cur.parent
+            return pos
 
-        def collect_limbs_from_chest(chest: SkeletonJoint) -> tuple[SkeletonJoint, SkeletonJoint, SkeletonJoint]:
-            # chest is the first joint with exactly 3 children after spine
-            # We must decide which is head, left arm, right arm by name heuristics.
+        def farthest_descendant_from(joint: SkeletonJoint, origin: SkeletonJoint) -> tuple[SkeletonJoint, np.ndarray]:
+            # DFS to find leaf with farthest distance from origin; return (leaf, vector_from_origin)
+            origin_pos = get_joint_world_position(origin)
+            best_leaf = joint
+            best_vec = get_joint_world_position(joint) - origin_pos
+            best_dist = float(np.linalg.norm(best_vec))
+            stack = [joint]
+            while stack:
+                node = stack.pop()
+                if not node.children:
+                    v = get_joint_world_position(node) - origin_pos
+                    d = float(np.linalg.norm(v))
+                    if d > best_dist:
+                        best_dist = d
+                        best_leaf = node
+                        best_vec = v
+                else:
+                    for c in node.children:
+                        stack.append(c)
+            return best_leaf, best_vec
+
+        def find_spine_path_from_root(root: SkeletonJoint) -> list[SkeletonJoint]:
+            # Pure structural: for each root child, follow single-child chain until
+            # a 3-children node is found; choose the child reaching 3-children earliest.
+            if root is None:
+                return []
+            if not root.children:
+                return [root]
+
+            candidates: list[tuple[list[SkeletonJoint], int | None]] = []
+            for child in root.children:
+                path = [root, child]
+                current = child
+                depth_to_three: int | None = None
+                while True:
+                    children = current.children
+                    if not children:
+                        break
+                    if len(children) == 1:
+                        current = children[0]
+                        path.append(current)
+                        continue
+                    if len(children) == 3:
+                        path.append(current)
+                        depth_to_three = len(path) - 1
+                        break
+                    # Unexpected branching (2 or >=4): stop here
+                    break
+                candidates.append((path, depth_to_three))
+
+            with_three = [c for c in candidates if c[1] is not None]
+            if with_three:
+                chosen = min(with_three, key=lambda x: x[1])
+                return chosen[0]
+            # fallback: longest path
+            if candidates:
+                chosen = max(candidates, key=lambda x: len(x[0]))
+                return chosen[0]
+            return [root]
+
+        def collect_limbs_from_chest(chest: SkeletonJoint,
+                                     up_vec: np.ndarray,
+                                     right_vec: np.ndarray) -> tuple[SkeletonJoint, SkeletonJoint, SkeletonJoint]:
+            # Determine head as branch whose farthest vector aligns most with up
+            # The other two are arms; assign left/right by right_vec dot of farthest vectors
             assert len(chest.children) == 3
             head_candidate = None
-            left_candidate = None
-            right_candidate = None
+            best_align = -1e9
             for child in chest.children:
-                name_l = child.name.lower()
-                if any(k in name_l for k in ["head", "neck"]):
+                _, v = farthest_descendant_from(child, chest)
+                n = float(np.linalg.norm(v))
+                if n < 1e-8:
+                    continue
+                align = float(np.dot(v / n, up_vec))
+                if align > best_align:
+                    best_align = align
                     head_candidate = child
-                elif any(k in name_l for k in ["left", "l_"]):
-                    left_candidate = child
-                elif any(k in name_l for k in ["right", "r_"]):
-                    right_candidate = child
-            # Fallbacks if names are ambiguous: use offsets X to disambiguate if available
-            missing = [x is None for x in [
-                head_candidate, left_candidate, right_candidate]]
-            if any(missing):
-                # Sort by x offset sign: left has x>0 for many rigs, right x<0; head y> others
-                # Use absolute heuristics carefully; fallback to arbitrary but consistent ordering
-                sorted_children = sorted(
-                    chest.children,
-                    key=lambda j: (-(j.offset[1] if hasattr(j.offset,
-                                   '__iter__') else 0.0), j.offset[0]),
-                )
-                # Highest Y likely head
-                head_candidate = head_candidate or sorted_children[0]
-                rem = [c for c in chest.children if c is not head_candidate]
-                if len(rem) == 2:
-                    if rem[0].offset[0] >= rem[1].offset[0]:
-                        left_candidate = left_candidate or rem[0]
-                        right_candidate = right_candidate or rem[1]
-                    else:
-                        left_candidate = left_candidate or rem[1]
-                        right_candidate = right_candidate or rem[0]
-                else:
-                    # If structure is unexpected, assign arbitrarily
-                    for c in rem:
-                        if left_candidate is None:
-                            left_candidate = c
-                        elif right_candidate is None:
-                            right_candidate = c
+            arm_candidates = [c for c in chest.children if c is not head_candidate]
+            if len(arm_candidates) != 2:
+                # Fallback: arbitrary split
+                left_candidate = arm_candidates[0] if arm_candidates else None
+                right_candidate = arm_candidates[1] if len(arm_candidates) > 1 else None
+                return head_candidate, left_candidate, right_candidate
+            # Decide left/right via right_vec
+            _, a_vec = farthest_descendant_from(arm_candidates[0], chest)
+            _, b_vec = farthest_descendant_from(arm_candidates[1], chest)
+            a_dot = float(np.dot(a_vec, right_vec))
+            b_dot = float(np.dot(b_vec, right_vec))
+            # Convention observed in BVHs: positive projection corresponds to Left side
+            if a_dot >= b_dot:
+                left_candidate = arm_candidates[0]
+                right_candidate = arm_candidates[1]
+            else:
+                left_candidate = arm_candidates[1]
+                right_candidate = arm_candidates[0]
             return head_candidate, left_candidate, right_candidate
 
         def traverse_chain_down(joint: SkeletonJoint) -> list[SkeletonJoint]:
@@ -536,6 +564,20 @@ class Skeleton:
         if root is None:
             return
 
+        # Orientation basis
+        up_axis = self.orientation.get('up', 'y')
+        fwd_axis = self.orientation.get('forward', 'z')
+        axis_map = {
+            'x': np.array([1.0, 0.0, 0.0]), '-x': np.array([-1.0, 0.0, 0.0]),
+            'y': np.array([0.0, 1.0, 0.0]), '-y': np.array([0.0, -1.0, 0.0]),
+            'z': np.array([0.0, 0.0, 1.0]), '-z': np.array([0.0, 0.0, -1.0]),
+        }
+        up_vec = axis_map.get(up_axis, np.array([0.0, 1.0, 0.0]))
+        fwd_vec = axis_map.get(fwd_axis, np.array([0.0, 0.0, 1.0]))
+        # Right-handed basis: right = up x forward
+        right_vec = np.cross(up_vec / (np.linalg.norm(up_vec) + 1e-12),
+                             fwd_vec / (np.linalg.norm(fwd_vec) + 1e-12))
+
         # Find spine path from root to first branching (3-children) after root
         spine_path = find_spine_path_from_root(root)
         # The chest is the last in path if it has 3 children; otherwise try to find next node with 3 children
@@ -551,26 +593,28 @@ class Skeleton:
         # Assign spine label (including hips/root)
         assign_label_to_group(spine_path, "Spine")
 
-        # Legs: from hips/root, two branches that end with feet/toes
+        # Legs: select two root branches most opposite to up (downwards)
         leg_candidates = [c for c in root.children if c not in spine_path]
-        # If root is hips and has 3 children, two non-spine branches are legs
-        legs = []
-        for c in leg_candidates:
-            # Heuristic: choose branches that go downward in Y first segment
-            if c is chest:
-                continue
-            legs.append(c)
-        if len(legs) > 2 and chest in legs:
-            legs.remove(chest)
-        legs = legs[:2]
+        def downward_score(node: SkeletonJoint) -> float:
+            _, v = farthest_descendant_from(node, root)
+            n = float(np.linalg.norm(v))
+            if n < 1e-8:
+                return -1e9
+            return -float(np.dot(v / n, up_vec))
+        legs_sorted = sorted(leg_candidates, key=downward_score, reverse=True)
+        legs = legs_sorted[:2]
 
         if len(legs) == 2:
-            left_leg_root, right_leg_root = None, None
-            # Decide left/right by x offset of first joint
-            if legs[0].offset[0] >= legs[1].offset[0]:
-                left_leg_root, right_leg_root = legs[0], legs[1]
+            a, b = legs
+            _, a_v = farthest_descendant_from(a, root)
+            _, b_v = farthest_descendant_from(b, root)
+            a_dot_r = float(np.dot(a_v, right_vec))
+            b_dot_r = float(np.dot(b_v, right_vec))
+            # Convention observed in BVHs: positive projection corresponds to Left side
+            if a_dot_r >= b_dot_r:
+                left_leg_root, right_leg_root = a, b
             else:
-                left_leg_root, right_leg_root = legs[1], legs[0]
+                left_leg_root, right_leg_root = b, a
 
             left_leg_nodes = traverse_branch_until_end(left_leg_root)
             right_leg_nodes = traverse_branch_until_end(right_leg_root)
@@ -580,7 +624,7 @@ class Skeleton:
         # Arms and head from chest
         if len(chest.children) == 3:
             head_node, left_arm_root, right_arm_root = collect_limbs_from_chest(
-                chest)
+                chest, up_vec, right_vec)
             if head_node is not None:
                 head_nodes = traverse_branch_until_end(head_node)
                 assign_label_to_group(head_nodes, "Head")
@@ -597,6 +641,7 @@ class Skeleton:
         Returns: {"forward": 'x', "up": 'y}
         It can be x, y, z, or -x, -y, -z.
         """
+        # Prefer semantic labels when available; otherwise fallback to structural method.
         # We need 2 vectors, the spine and left end to right end (not necessarily the hands)
         # The spine determines the up direction. the other vector and up determine the forward direction.
 
@@ -640,7 +685,8 @@ class Skeleton:
         # Find spine joints to determine up direction
         spine_joints = find_joints_by_label("Spine")
         if not spine_joints:
-            return {"forward": "x", "up": "y"}  # fallback
+            # No labels present -> structural fallback
+            return self.guess_orientations_with_no_labels()
 
         # Calculate spine direction (from bottom to top)
         if len(spine_joints) >= 2:
@@ -684,6 +730,10 @@ class Skeleton:
                     max(left_leg_joints, key=lambda j: np.linalg.norm(get_joint_world_position(j)))]
                 right_endpoints = [
                     max(right_leg_joints, key=lambda j: np.linalg.norm(get_joint_world_position(j)))]
+
+        # If neither arms nor legs were found via labels, fallback to structural method
+        if not left_endpoints or not right_endpoints:
+            return self.guess_orientations_with_no_labels()
 
         # Convert up_axis to a vector for cross product calculation
         up_components = {'x': 0, 'y': 1, 'z': 2, '-x': 0, '-y': 1, '-z': 2}
