@@ -208,6 +208,119 @@ class Skeleton:
             # If a joint has 3+ children, it's likely a finger branching point
             return len(joint.children) >= 3
 
+        # --- Structural helpers for safe pruning of finger branches ---
+        def find_spine_path_from_root(root: SkeletonJoint) -> list[SkeletonJoint]:
+            # Pure structural: follow each root child down its single-child chain
+            # and pick the one that reaches a 3-children node earliest; otherwise longest chain
+            if root is None:
+                return []
+            if not root.children:
+                return [root]
+
+            candidates: list[tuple[list[SkeletonJoint], int | None]] = []
+            for child in root.children:
+                path = [root, child]
+                current = child
+                depth_to_three: int | None = None
+                while True:
+                    children = current.children
+                    if not children:
+                        break
+                    if len(children) == 1:
+                        current = children[0]
+                        path.append(current)
+                        continue
+                    if len(children) == 3:
+                        path.append(current)
+                        depth_to_three = len(path) - 1
+                        break
+                    # Unexpected branching (2 or >=4): stop here
+                    break
+                candidates.append((path, depth_to_three))
+
+            with_three = [c for c in candidates if c[1] is not None]
+            if with_three:
+                chosen = min(with_three, key=lambda x: x[1])
+                return chosen[0]
+            if candidates:
+                chosen = max(candidates, key=lambda x: len(x[0]))
+                return chosen[0]
+            return [root]
+
+        def longest_path_total_length_from(node: SkeletonJoint) -> float:
+            # Sum of offsets along the longest path from this node to any leaf
+            if not node.children:
+                return 0.0
+            best = 0.0
+            for c in node.children:
+                seg = float(np.linalg.norm(np.asarray(c.offset).reshape(-1)))
+                best = max(best, seg + longest_path_total_length_from(c))
+            return best
+
+        def child_chain_stats(child: SkeletonJoint) -> tuple[int, float, bool]:
+            # Return (depth, total_length, is_linear_chain)
+            depth = 0
+            total = 0.0
+            current = child
+            linear = True
+            while True:
+                depth += 1
+                if not current.children:
+                    break
+                if len(current.children) != 1:
+                    linear = False
+                    # still accumulate longest single branch for total
+                    totals = []
+                    for c in current.children:
+                        seg = float(np.linalg.norm(np.asarray(c.offset).reshape(-1)))
+                        totals.append(seg + longest_path_total_length_from(c))
+                    total += float(max(totals))
+                    break
+                next_node = current.children[0]
+                seg = float(np.linalg.norm(np.asarray(next_node.offset).reshape(-1)))
+                total += seg
+                current = next_node
+            return depth, total, linear
+
+        def prune_finger_branches(joint: SkeletonJoint, protected_nodes: set[SkeletonJoint]):
+            # Prune multiple small branches (fingers) from palm/wrist-like nodes
+            if joint in protected_nodes:
+                return
+            if joint.parent is None:
+                return
+            if len(joint.children) < 3:
+                return
+
+            children = list(joint.children)
+            stats = [child_chain_stats(c) for c in children]
+            depths = [d for d, _, _ in stats]
+            totals = [t for _, t, _ in stats]
+            linears = [lin for _, _, lin in stats]
+
+            # Heuristic 1: classic finger fan at palm/wrist: 4+ roughly linear short chains of depth 2-5
+            if len(children) >= 4:
+                linear_count = sum(1 for lin in linears if lin)
+                depth_ok = sum(1 for d in depths if 2 <= d <= 5)
+                # All or all-but-one branches satisfy linear and depth bounds
+                if linear_count >= len(children) - 1 and depth_ok >= len(children) - 1:
+                    # Remove all children (entire finger subtrees)
+                    for child in children:
+                        if child in joint.children:
+                            joint.remove_child(child)
+                    return
+
+            # Heuristic 2: predominantly many short branches vs one long branch (fallback)
+            if totals:
+                keep_index = int(np.argmax(np.asarray(totals)))
+                keep_total = float(totals[keep_index])
+                short_count = sum(1 for t in totals if t < 0.7 * keep_total)
+                if short_count >= 3 and len(children) >= 4:
+                    for idx, child in enumerate(children):
+                        if idx == keep_index:
+                            continue
+                        if child in joint.children:
+                            joint.remove_child(child)
+
         def should_remove_joint(joint: SkeletonJoint) -> bool:
             """Determine if a joint should be removed."""
             # Check by name
@@ -252,6 +365,15 @@ class Skeleton:
                 child.offset = joint.offset + child.offset
                 parent.add_child(child)
 
+        # Build protected set (root->chest path) to avoid pruning important torso branches
+        protected: set[SkeletonJoint] = set()
+        try:
+            spine_path = find_spine_path_from_root(self.skeleton)
+            protected.update(spine_path)
+        except Exception:
+            # If any issue arises, fall back with empty protected set
+            pass
+
         def traverse_and_remove(joint: SkeletonJoint):
             """Recursively traverse and remove unwanted joints."""
             if not joint:
@@ -262,6 +384,9 @@ class Skeleton:
             children_copy = joint.children.copy()
             for child in children_copy:
                 traverse_and_remove(child)
+
+            # After children processed, try structural pruning at this joint
+            prune_finger_branches(joint, protected)
 
             # Then check if current joint should be removed
             if should_remove_joint(joint):
