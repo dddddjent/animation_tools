@@ -724,158 +724,190 @@ class Skeleton:
 
     def guess_orientations_with_no_labels(self) -> dict[str, str]:
         """
-        1. Find the relationship of the end effectors with the root. You can determine the forward
-        direction. Also, the sign of the direction 
-        2. It's very easy to find the spine. The start is the root and the end is the first joint with 3 children.
-        3. The spine tells the up direction.
+        1. It's very easy to find the spine. The start is the root and the end is the first joint with 3 children.
+        2. The spine tells the up direction.
+        3. Find the relationship of the end effectors with the root. You can determine the forward
+        line firstly (regardless of the sign). The sign of the direction 
+            - Only use the head/two legs to determine the forward direction.
+            - The legs can be determined purely by the structure of the skeleton.
+            - The head is the one that aligns most with the up direction.
+            - The sign is by avg the head and two legs relative to the root, and the sign of the 
+            avg's component along the forward line.
         """
-        def get_joint_world_position(joint: SkeletonJoint) -> np.ndarray:
-            pos = np.zeros(3)
-            current = joint
-            while current is not None:
-                pos += np.asarray(current.offset).flatten()
-                current = current.parent
-            return pos
-
-        def normalize(v: np.ndarray) -> np.ndarray:
-            n = np.linalg.norm(v)
-            return v if n < 1e-8 else v / n
-
-        def vector_to_axis_name(vector: np.ndarray) -> str:
-            v = np.asarray(vector, dtype=float)
-            if np.linalg.norm(v) < 1e-8:
-                return "y"
-            v = v / np.linalg.norm(v)
-            abs_components = np.abs(v)
-            idx = int(np.argmax(abs_components))
-            axis = ['x', 'y', 'z'][idx]
-            sign = '-' if v[idx] < 0 else ''
-            return f"{sign}{axis}"
-
-        def depth_to_three_children(node: SkeletonJoint, max_depth: int = 12) -> int:
-            from collections import deque
-            queue = deque([(node, 0)])
-            best = None
-            while queue:
-                cur, d = queue.popleft()
-                if d > max_depth:
-                    continue
-                if len(cur.children) == 3:
-                    best = d if best is None else min(best, d)
-                for c in cur.children:
-                    queue.append((c, d + 1))
-            return best if best is not None else 10**9
-
-        def longest_single_chain_depth(node: SkeletonJoint, max_depth: int = 32) -> int:
-            depth = 0
-            cur = node
-            while depth < max_depth and cur is not None and len(cur.children) == 1:
-                cur = cur.children[0]
-                depth += 1
-            return depth
-
         if not self.skeleton:
-            return {"forward": "x", "up": "y"}
-
-        root = self.skeleton
-
-        # Find spine-like path: from root towards the first node with exactly 3 children (excluding root)
-        path = [root]
-        current = root
-        for _ in range(64):
-            if current is not root and len(current.children) == 3:
-                break
-            if not current.children:
-                break
-            if len(current.children) == 1:
-                current = current.children[0]
-                path.append(current)
-                continue
-            children = current.children
-            depths = [depth_to_three_children(c) for c in children]
-            min_depth = min(depths)
-            if min_depth < 10**9:
-                next_child = children[int(np.argmin(depths))]
-            else:
-                chain_depths = [longest_single_chain_depth(c) for c in children]
-                next_child = children[int(np.argmax(chain_depths))]
-            current = next_child
-            path.append(current)
-
-        chest = current
-        root_pos = get_joint_world_position(root)
-        chest_pos = get_joint_world_position(chest)
-        spine_vec = chest_pos - root_pos
-        if np.linalg.norm(spine_vec) < 1e-8:
-            # Fallback: use highest joint in world Y as top reference
-            all_nodes: list[SkeletonJoint] = []
-            def collect(n: SkeletonJoint):
-                all_nodes.append(n)
-                for c in n.children:
-                    collect(c)
-            collect(root)
-            if len(all_nodes) >= 2:
-                top = max(all_nodes, key=lambda j: get_joint_world_position(j)[1])
-                spine_vec = get_joint_world_position(top) - root_pos
-            else:
-                spine_vec = np.array([0.0, 1.0, 0.0])
-
-        up_dir = normalize(spine_vec)
-        up_axis = vector_to_axis_name(up_dir)
-
-        # Gather end effectors (leaves)
-        leaves: list[np.ndarray] = []
-        def collect_leaves(n: SkeletonJoint):
-            if not n.children:
-                leaves.append(get_joint_world_position(n))
-                return
-            for c in n.children:
-                collect_leaves(c)
-        collect_leaves(root)
-
-        # Project leaf positions onto plane orthogonal to up, relative to root
-        leaves_rel = []
-        for p in leaves:
-            rel = p - root_pos
-            rel = rel - np.dot(rel, up_dir) * up_dir
-            if np.linalg.norm(rel) > 1e-6:
-                leaves_rel.append(rel)
-
-        forward_axis = "z"
-        if len(leaves_rel) >= 2:
-            X = np.stack(leaves_rel, axis=0)
-            Xc = X - X.mean(axis=0, keepdims=True)
-            if np.linalg.norm(Xc) > 1e-8:
-                U, S, Vt = np.linalg.svd(Xc, full_matrices=False)
-                lr_dir = Vt[0]
-                lr_dir = normalize(lr_dir - np.dot(lr_dir, up_dir) * up_dir)
-                if np.linalg.norm(lr_dir) < 1e-8 and Vt.shape[0] >= 2:
-                    lr_dir = Vt[1]
-                    lr_dir = normalize(lr_dir - np.dot(lr_dir, up_dir) * up_dir)
-                if np.linalg.norm(lr_dir) < 1e-8:
-                    lr_dir = normalize(np.cross(up_dir, np.array([1.0, 0.0, 0.0])))
-                    if np.linalg.norm(lr_dir) < 1e-8:
-                        lr_dir = normalize(np.cross(up_dir, np.array([0.0, 0.0, 1.0])))
-                fwd_dir = np.cross(up_dir, lr_dir)
-                if np.linalg.norm(fwd_dir) < 1e-8 and Vt.shape[0] >= 2:
-                    fwd_dir = Vt[1]
-                    fwd_dir = normalize(fwd_dir - np.dot(fwd_dir, up_dir) * up_dir)
-                proj_means = (X.mean(axis=0))
-                if np.dot(proj_means, fwd_dir) < 0:
-                    fwd_dir = -fwd_dir
-                forward_axis = vector_to_axis_name(fwd_dir)
+            return {"forward": "z", "up": "y"}  # Default fallback
+        
+        def get_joint_world_position(joint: SkeletonJoint) -> np.ndarray:
+            """Calculate the world position of a joint by accumulating offsets."""
+            position = np.zeros(3)
+            current = joint
+            while current:
+                position += np.asarray(current.offset).flatten()
+                current = current.parent
+            return position
+        
+        def vector_to_axis_name(vector: np.ndarray) -> str:
+            """Convert a direction vector to the closest axis name."""
+            if np.linalg.norm(vector) < 1e-8:
+                return "y"  # Fallback for zero vectors
+            
+            # Normalize the vector
+            vector = vector / np.linalg.norm(vector)
+            
+            # Find the axis with maximum absolute component
+            abs_components = np.abs(vector)
+            max_idx = np.argmax(abs_components)
+            
+            # Determine if it's positive or negative
+            sign = '-' if vector[max_idx] < 0 else ''
+            axis_names = ['x', 'y', 'z']
+            return f"{sign}{axis_names[max_idx]}"
+        
+        # Step 1: Find the spine - from root to first joint with 3 children
+        def find_spine_path(root: SkeletonJoint) -> list[SkeletonJoint]:
+            """Find spine path from root to first joint with exactly 3 children."""
+            spine_path = [root]
+            current = root
+            
+            while True:
+                # Look for next joint in spine path
+                children = current.children
+                if not children:
+                    break
+                    
+                # If current joint has 3 children and it's not the root, we found the chest
+                if len(children) == 3 and current != root:
+                    break
+                    
+                # Continue along the spine - prefer single child path
+                if len(children) == 1:
+                    current = children[0]
+                    spine_path.append(current)
+            
+            return spine_path
+        
+        spine_path = find_spine_path(self.skeleton)
+        
+        # Step 2: Determine up direction from spine
+        if len(spine_path) >= 2:
+            spine_start = get_joint_world_position(spine_path[0])
+            spine_end = get_joint_world_position(spine_path[-1])
+            spine_vector = spine_end - spine_start
         else:
-            avg = np.zeros(3) if len(leaves_rel) == 0 else normalize(np.mean(np.stack(leaves_rel, axis=0), axis=0))
-            if np.linalg.norm(avg) < 1e-8:
-                cand = np.array([1.0, 0.0, 0.0])
-                if abs(np.dot(cand, up_dir)) > 0.8:
-                    cand = np.array([0.0, 0.0, 1.0])
-                fwd_dir = normalize(np.cross(up_dir, cand))
-            else:
-                avg = avg - np.dot(avg, up_dir) * up_dir
-                fwd_dir = normalize(avg)
-            forward_axis = vector_to_axis_name(fwd_dir)
-
+            # Use first joint's offset as spine direction
+            spine_vector = spine_path[0].offset
+        
+        up_axis = vector_to_axis_name(spine_vector)
+        
+        # Step 3: Find end effectors - head and legs
+        def find_end_effectors():
+            """Find head and leg end effectors."""
+            root = self.skeleton
+            
+            # Find legs - these are typically children of root that go downward
+            leg_candidates = []
+            head_candidate = None
+            
+            # Look for the chest (joint with 3 children) to find the head
+            chest = spine_path[-1] if len(spine_path) > 1 else root
+            
+            # If chest has 3 children, one should be the head (most upward)
+            if len(chest.children) == 3:
+                chest_children_positions = [(child, get_joint_world_position(child)) 
+                                          for child in chest.children]
+                
+                # Head is the one that aligns most with the up direction
+                up_vector = np.zeros(3)
+                up_idx = {'x': 0, 'y': 1, 'z': 2}.get(up_axis.lstrip('-'), 1)
+                up_vector[up_idx] = 1 if not up_axis.startswith('-') else -1
+                
+                head_candidate = max(chest.children, 
+                                   key=lambda child: np.dot(get_joint_world_position(child), up_vector))
+            
+            # Find legs from root children (excluding spine path joints)
+            spine_joints_set = set(spine_path)
+            for child in root.children:
+                if child not in spine_joints_set:
+                    # This could be a leg - traverse to find end effector
+                    leg_end = find_limb_end_effector(child)
+                    if leg_end:
+                        leg_candidates.append(leg_end)
+            
+            # If we found more than 2 leg candidates, pick the 2 that are most downward
+            if len(leg_candidates) > 2:
+                up_vector = np.zeros(3)
+                up_idx = {'x': 0, 'y': 1, 'z': 2}.get(up_axis.lstrip('-'), 1)
+                up_vector[up_idx] = 1 if not up_axis.startswith('-') else -1
+                
+                leg_candidates = sorted(leg_candidates, 
+                                      key=lambda leg: np.dot(get_joint_world_position(leg), up_vector))[:2]
+            
+            return head_candidate, leg_candidates
+        
+        def find_limb_end_effector(start_joint: SkeletonJoint) -> SkeletonJoint:
+            """Find the end effector (leaf or furthest joint) of a limb."""
+            current = start_joint
+            
+            # Traverse down the longest chain
+            while current.children:
+                if len(current.children) == 1:
+                    current = current.children[0]
+                else:
+                    # Multiple children - choose the one that extends the limb furthest
+                    furthest_child = max(current.children, 
+                                       key=lambda child: np.linalg.norm(get_joint_world_position(child)))
+                    current = furthest_child
+            
+            return current
+        
+        head, legs = find_end_effectors()
+        
+        # Step 4: Determine forward direction
+        if head and len(legs) >= 2:
+            # Get positions relative to root
+            root_pos = get_joint_world_position(self.skeleton)
+            head_pos = get_joint_world_position(head)
+            leg1_pos = get_joint_world_position(legs[0])
+            leg2_pos = get_joint_world_position(legs[1])
+            
+            # Calculate relative positions
+            head_rel = head_pos - root_pos
+            leg1_rel = leg1_pos - root_pos
+            leg2_rel = leg2_pos - root_pos
+            
+            #! Average the three end effector positions
+            avg_end_effector = (head_rel + leg1_rel + leg2_rel) / 3
+            
+            # Determine forward line direction (cross product of up with left-right vector)
+            left_right_vector = leg2_rel - leg1_rel  # Arbitrary leg order initially
+            
+            # Convert up axis to vector
+            up_vector = np.zeros(3)
+            up_idx = {'x': 0, 'y': 1, 'z': 2}.get(up_axis.lstrip('-'), 1)
+            up_vector[up_idx] = 1 if not up_axis.startswith('-') else -1
+            
+            # Forward direction is perpendicular to both up and left-right
+            forward_vector = np.cross(up_vector, left_right_vector)
+            
+            # If cross product is too small, use projection method
+            if np.linalg.norm(forward_vector) < 1e-6:
+                # Project avg_end_effector onto plane perpendicular to up
+                forward_vector = avg_end_effector - np.dot(avg_end_effector, up_vector) * up_vector
+            
+            # Determine sign based on avg component along forward line
+            if np.linalg.norm(forward_vector) > 1e-6:
+                forward_sign = np.dot(avg_end_effector, forward_vector)
+                if forward_sign < 0:
+                    forward_vector = -forward_vector
+            
+            forward_axis = vector_to_axis_name(forward_vector)
+            
+        else:
+            # Fallback: choose perpendicular axis to up
+            up_idx = {'x': 0, 'y': 1, 'z': 2}.get(up_axis.lstrip('-'), 1)
+            forward_axes = ['x', 'y', 'z']
+            forward_axis = next(axis for i, axis in enumerate(forward_axes) if i != up_idx)
+        
         return {"forward": forward_axis, "up": up_axis}
 
     def align_orientation(self, new_orientation: dict[str, str]):
