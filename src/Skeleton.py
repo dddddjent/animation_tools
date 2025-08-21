@@ -734,201 +734,214 @@ class Skeleton:
             - The sign is by avg the head and two legs relative to the root, and the sign of the 
             avg's component along the forward line.
         """
-        if not self.skeleton:
-            return {"forward": "z", "up": "y"}  # Default fallback
-        
+        # Fallback orientation
+        default_orientation = {"forward": "x", "up": "y"}
+
+        root = self.skeleton
+        if root is None:
+            return default_orientation
+
+        # Helpers
         def get_joint_world_position(joint: SkeletonJoint) -> np.ndarray:
-            """Calculate the world position of a joint by accumulating offsets."""
-            position = np.zeros(3)
-            current = joint
-            while current:
-                position += np.asarray(current.offset).flatten()
-                current = current.parent
-            return position
-        
+            pos = np.zeros(3)
+            cur = joint
+            while cur is not None:
+                pos += np.asarray(cur.offset).flatten()
+                cur = cur.parent
+            return pos
+
         def vector_to_axis_name(vector: np.ndarray) -> str:
-            """Convert a direction vector to the closest axis name."""
-            if np.linalg.norm(vector) < 1e-8:
-                return "y"  # Fallback for zero vectors
-            
-            # Normalize the vector
-            vector = vector / np.linalg.norm(vector)
-            
-            # Find the axis with maximum absolute component
-            abs_components = np.abs(vector)
-            max_idx = np.argmax(abs_components)
-            
-            # Determine if it's positive or negative
-            sign = '-' if vector[max_idx] < 0 else ''
-            axis_names = ['x', 'y', 'z']
-            return f"{sign}{axis_names[max_idx]}"
-        
-        # Step 1: Find the spine - from root to first joint with 3 children
-        def find_spine_path(root: SkeletonJoint) -> list[SkeletonJoint]:
-            """Find spine path from root to first joint with exactly 3 children."""
-            spine_path = [root]
-            current = root
-            
-            while True:
-                # Look for next joint in spine path
-                children = current.children
-                if not children:
+            v = np.asarray(vector, dtype=float)
+            n = np.linalg.norm(v)
+            if n < 1e-8:
+                return "y"
+            v = v / n
+            idx = int(np.argmax(np.abs(v)))
+            sign = '-' if v[idx] < 0 else ''
+            return f"{sign}{['x','y','z'][idx]}"
+
+        def find_spine_path_from_root(r: SkeletonJoint) -> list[SkeletonJoint]:
+            # Purely structural inference: choose the branch from root that
+            # reaches a 3-children node earliest; fallback to the longest single-child chain.
+            if r is None:
+                return []
+            if not r.children:
+                return [r]
+
+            candidates: list[tuple[list[SkeletonJoint], int | None]] = []
+            for child in r.children:
+                path = [r, child]
+                current = child
+                depth_to_three: int | None = None
+                while True:
+                    children = current.children
+                    if not children:
+                        break
+                    if len(children) == 1:
+                        current = children[0]
+                        path.append(current)
+                        continue
+                    if len(children) == 3:
+                        path.append(current)
+                        depth_to_three = len(path) - 1
+                        break
+                    # Unexpected branching (2 or >=4): stop here
                     break
-                    
-                # If current joint has 3 children and it's not the root, we found the chest
-                if len(children) == 3 and current != root:
-                    break
-                    
-                # Continue along the spine - prefer single child path
-                if len(children) == 1:
-                    current = children[0]
-                    spine_path.append(current)
+                candidates.append((path, depth_to_three))
+
+            with_three = [c for c in candidates if c[1] is not None]
+            if with_three:
+                # Choose the one with minimal depth to three-children (closest chest)
+                chosen = min(with_three, key=lambda x: x[1])
+                return chosen[0]
+            # Fallback: choose the longest path
+            if candidates:
+                chosen = max(candidates, key=lambda x: len(x[0]))
+                return chosen[0]
+            return [r]
+
+        def farthest_descendant_from(joint: SkeletonJoint, origin: SkeletonJoint) -> SkeletonJoint:
+            # DFS to find farthest leaf from origin
+            stack = [joint]
+            best_node = joint
+            best_dist = -1.0
+            origin_pos = get_joint_world_position(origin)
+            while stack:
+                node = stack.pop()
+                if not node.children:
+                    d = float(np.linalg.norm(
+                        get_joint_world_position(node) - origin_pos))
+                    if d > best_dist:
+                        best_dist = d
+                        best_node = node
                 else:
-                    # Multiple children - try to find the most spine-like one
-                    spine_candidate = None
-                    for child in children:
-                        child_name = child.name.lower()
-                        if any(keyword in child_name for keyword in 
-                               ['spine', 'chest', 'torso', 'pelvis', 'hip']):
-                            spine_candidate = child
-                            break
-                    
-                    if spine_candidate:
-                        current = spine_candidate
-                        spine_path.append(current)
-                    else:
-                        # Choose the child that continues upward most
-                        if len(children) > 0:
-                            # For now, just pick the first child to avoid getting stuck
-                            current = children[0]
-                            spine_path.append(current)
-                        else:
-                            break
-            
-            return spine_path
-        
-        spine_path = find_spine_path(self.skeleton)
-        
-        # Step 2: Determine up direction from spine
+                    for c in node.children:
+                        stack.append(c)
+            return best_node
+
+        # 1-2) Find spine and deduce up direction (unsigned first)
+        spine_path = find_spine_path_from_root(root)
         if len(spine_path) >= 2:
-            spine_start = get_joint_world_position(spine_path[0])
-            spine_end = get_joint_world_position(spine_path[-1])
-            spine_vector = spine_end - spine_start
+            spine_start = spine_path[0]
+            # Find the first node with 3 children below the start; if none, use last on path
+            chest = spine_path[-1]
+            if len(chest.children) != 3:
+                # Search further below for first 3-children node
+                search_stack = [chest]
+                while search_stack:
+                    node = search_stack.pop()
+                    if len(node.children) == 3 and node is not root:
+                        chest = node
+                        break
+                    for c in node.children:
+                        search_stack.append(c)
         else:
-            # Use first joint's offset as spine direction
-            spine_vector = spine_path[0].offset
-        
-        up_axis = vector_to_axis_name(spine_vector)
-        
-        # Step 3: Find end effectors - head and legs
-        def find_end_effectors():
-            """Find head and leg end effectors."""
-            root = self.skeleton
-            
-            # Find legs - these are typically children of root that go downward
-            leg_candidates = []
-            head_candidate = None
-            
-            # Look for the chest (joint with 3 children) to find the head
-            chest = spine_path[-1] if len(spine_path) > 1 else root
-            
-            # If chest has 3 children, one should be the head (most upward)
-            if len(chest.children) == 3:
-                chest_children_positions = [(child, get_joint_world_position(child)) 
-                                          for child in chest.children]
-                
-                # Head is the one that aligns most with the up direction
-                up_vector = np.zeros(3)
-                up_idx = {'x': 0, 'y': 1, 'z': 2}.get(up_axis.lstrip('-'), 1)
-                up_vector[up_idx] = 1 if not up_axis.startswith('-') else -1
-                
-                head_candidate = max(chest.children, 
-                                   key=lambda child: np.dot(get_joint_world_position(child), up_vector))
-            
-            # Find legs from root children (excluding spine path joints)
-            spine_joints_set = set(spine_path)
-            for child in root.children:
-                if child not in spine_joints_set:
-                    # This could be a leg - traverse to find end effector
-                    leg_end = find_limb_end_effector(child)
-                    if leg_end:
-                        leg_candidates.append(leg_end)
-            
-            # If we found more than 2 leg candidates, pick the 2 that are most downward
-            if len(leg_candidates) > 2:
-                up_vector = np.zeros(3)
-                up_idx = {'x': 0, 'y': 1, 'z': 2}.get(up_axis.lstrip('-'), 1)
-                up_vector[up_idx] = 1 if not up_axis.startswith('-') else -1
-                
-                leg_candidates = sorted(leg_candidates, 
-                                      key=lambda leg: np.dot(get_joint_world_position(leg), up_vector))[:2]
-            
-            return head_candidate, leg_candidates
-        
-        def find_limb_end_effector(start_joint: SkeletonJoint) -> SkeletonJoint:
-            """Find the end effector (leaf or furthest joint) of a limb."""
-            current = start_joint
-            
-            # Traverse down the longest chain
-            while current.children:
-                if len(current.children) == 1:
-                    current = current.children[0]
-                else:
-                    # Multiple children - choose the one that extends the limb furthest
-                    furthest_child = max(current.children, 
-                                       key=lambda child: np.linalg.norm(get_joint_world_position(child)))
-                    current = furthest_child
-            
-            return current
-        
-        head, legs = find_end_effectors()
-        
-        # Step 4: Determine forward direction
-        if head and len(legs) >= 2:
-            # Get positions relative to root
-            root_pos = get_joint_world_position(self.skeleton)
-            head_pos = get_joint_world_position(head)
-            leg1_pos = get_joint_world_position(legs[0])
-            leg2_pos = get_joint_world_position(legs[1])
-            
-            # Calculate relative positions
-            head_rel = head_pos - root_pos
-            leg1_rel = leg1_pos - root_pos
-            leg2_rel = leg2_pos - root_pos
-            
-            #! Average the three end effector positions
-            avg_end_effector = (head_rel + leg1_rel + leg2_rel) / 3
-            
-            # Determine forward line direction (cross product of up with left-right vector)
-            left_right_vector = leg2_rel - leg1_rel  # Arbitrary leg order initially
-            
-            # Convert up axis to vector
-            up_vector = np.zeros(3)
-            up_idx = {'x': 0, 'y': 1, 'z': 2}.get(up_axis.lstrip('-'), 1)
-            up_vector[up_idx] = 1 if not up_axis.startswith('-') else -1
-            
-            # Forward direction is perpendicular to both up and left-right
-            forward_vector = np.cross(up_vector, left_right_vector)
-            
-            # If cross product is too small, use projection method
-            if np.linalg.norm(forward_vector) < 1e-6:
-                # Project avg_end_effector onto plane perpendicular to up
-                forward_vector = avg_end_effector - np.dot(avg_end_effector, up_vector) * up_vector
-            
-            # Determine sign based on avg component along forward line
-            if np.linalg.norm(forward_vector) > 1e-6:
-                forward_sign = np.dot(avg_end_effector, forward_vector)
-                if forward_sign < 0:
-                    forward_vector = -forward_vector
-            
-            forward_axis = vector_to_axis_name(forward_vector)
-            
+            # Degenerate skeleton; cannot infer reliably
+            return default_orientation
+
+        spine_vector = get_joint_world_position(
+            spine_path[-1]) - get_joint_world_position(spine_path[0])
+        spine_unit = spine_vector / (np.linalg.norm(spine_vector) + 1e-12)
+
+        # 3) Determine legs purely from structure (branches from root not on spine path)
+        non_spine_children = [c for c in root.children if c not in spine_path]
+        leg_roots = []
+        if len(non_spine_children) >= 2:
+            # Choose two whose farthest descendant from root goes most opposite to up (downwards)
+            def branch_down_score(node: SkeletonJoint) -> float:
+                leaf = farthest_descendant_from(node, root)
+                v = get_joint_world_position(
+                    leaf) - get_joint_world_position(root)
+                v_n = v / (np.linalg.norm(v) + 1e-12)
+                # use spine_unit (unsigned up) for downward measure
+                # more opposite to spine => larger score
+                return -float(np.dot(v_n, spine_unit))
+
+            scored = sorted(non_spine_children,
+                            key=branch_down_score, reverse=True)
+            leg_roots = scored[:2]
         else:
-            # Fallback: choose perpendicular axis to up
-            up_idx = {'x': 0, 'y': 1, 'z': 2}.get(up_axis.lstrip('-'), 1)
-            forward_axes = ['x', 'y', 'z']
-            forward_axis = next(axis for i, axis in enumerate(forward_axes) if i != up_idx)
-        
+            # Fallback: try grandchildren not on spine
+            candidates = []
+            for c in root.children:
+                if c in spine_path:
+                    continue
+                candidates.extend(c.children)
+            if len(candidates) >= 2:
+                leg_roots = candidates[:2]
+            # else: keep empty; we'll fall back to head-based forward later
+
+        # Determine the leaf endpoints for legs
+        if len(leg_roots) == 2:
+            leg_leaf_a = farthest_descendant_from(leg_roots[0], root)
+            leg_leaf_b = farthest_descendant_from(leg_roots[1], root)
+        else:
+            leg_leaf_a = None
+            leg_leaf_b = None
+
+        # Determine head: the branch from chest that aligns most with spine direction (unsigned)
+        head_leaf = None
+        if len(chest.children) >= 1:
+            best_align = -1e9
+            chest_pos = get_joint_world_position(chest)
+            for child in chest.children:
+                leaf = farthest_descendant_from(child, chest)
+                v = get_joint_world_position(leaf) - chest_pos
+                n = np.linalg.norm(v)
+                if n < 1e-8:
+                    continue
+                align = float(np.dot(v / n, spine_unit))
+                if align > best_align:
+                    best_align = align
+                    head_leaf = leaf
+
+        # If no head found, fallback to top of spine
+        if head_leaf is None:
+            head_leaf = spine_path[-1]
+
+        root_pos = get_joint_world_position(root)
+        head_rel = get_joint_world_position(head_leaf) - root_pos
+        if leg_leaf_a is not None and leg_leaf_b is not None:
+            leg_a_rel = get_joint_world_position(leg_leaf_a) - root_pos
+            leg_b_rel = get_joint_world_position(leg_leaf_b) - root_pos
+        else:
+            leg_a_rel = np.zeros(3)
+            leg_b_rel = np.zeros(3)
+
+        # Choose up sign so that head is in positive up direction
+        up_sign = 1.0 if float(np.dot(head_rel, spine_unit)) >= 0.0 else -1.0
+        up_unit_signed = spine_unit * up_sign
+        up_axis = vector_to_axis_name(up_unit_signed)
+        up_vec_n = up_unit_signed / (np.linalg.norm(up_unit_signed) + 1e-12)
+
+        # Forward line (direction without sign): up x (legB - legA)
+        left_right = leg_b_rel - leg_a_rel
+        if np.linalg.norm(left_right) < 1e-8:
+            # Fallback: use head projection onto plane orthogonal to up
+            head_proj = head_rel - np.dot(head_rel, up_vec_n) * up_vec_n
+            forward_line = head_proj
+        else:
+            forward_line = np.cross(up_vec_n, left_right)
+
+        if np.linalg.norm(forward_line) < 1e-8:
+            # Final fallback
+            forward_line = head_rel
+
+        # Determine sign by averaging head and two legs relative to root
+        # Average direction of available cues
+        count = 1.0
+        avg_vec = head_rel.copy()
+        if np.linalg.norm(leg_a_rel) > 1e-8:
+            avg_vec += leg_a_rel
+            count += 1.0
+        if np.linalg.norm(leg_b_rel) > 1e-8:
+            avg_vec += leg_b_rel
+            count += 1.0
+        avg_vec /= count
+        sign = 1.0 if float(np.dot(avg_vec, forward_line)) >= 0.0 else -1.0
+        forward_vec_signed = forward_line * sign
+
+        forward_axis = vector_to_axis_name(forward_vec_signed)
         return {"forward": forward_axis, "up": up_axis}
 
     def align_orientation(self, new_orientation: dict[str, str]):
