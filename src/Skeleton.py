@@ -783,6 +783,27 @@ class Skeleton:
                 if len(children) == 1:
                     current = children[0]
                     spine_path.append(current)
+                else:
+                    # Multiple children - try to find the most spine-like one
+                    spine_candidate = None
+                    for child in children:
+                        child_name = child.name.lower()
+                        if any(keyword in child_name for keyword in 
+                               ['spine', 'chest', 'torso', 'pelvis', 'hip']):
+                            spine_candidate = child
+                            break
+                    
+                    if spine_candidate:
+                        current = spine_candidate
+                        spine_path.append(current)
+                    else:
+                        # Choose the child that continues upward most
+                        if len(children) > 0:
+                            # For now, just pick the first child to avoid getting stuck
+                            current = children[0]
+                            spine_path.append(current)
+                        else:
+                            break
             
             return spine_path
         
