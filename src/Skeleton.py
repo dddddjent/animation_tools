@@ -68,6 +68,9 @@ class Skeleton:
 
         self.remove_unwanted_joints()
         self.remove_redundant_root()
+
+        self.orientation = self.guess_orientations_with_no_labels()
+        print(self.orientation)
         self._label_skeleton()
 
         # Use provided orientation or guess it
@@ -405,6 +408,10 @@ class Skeleton:
     def _label_skeleton(self):
         """
         Label the skeleton with the body_label_map.
+        - If a limb or body part can be labeled using the body_label_map, label it.
+        - Otherwise, because we got a guessed orientation from guess_orientations_with_no_labels, 
+        you can now label the limbs based on the guessed orientation. This orientation is to
+        determine the left and right limbs. The leg/spine/head... is purely based on the skeleton structure.
         """
         # Build fast alias->canonical map
         alias_to_canonical: dict[str, str] = {}
@@ -715,6 +722,162 @@ class Skeleton:
 
         return {"forward": forward_axis, "up": up_axis}
 
+    def guess_orientations_with_no_labels(self) -> dict[str, str]:
+        """
+        1. Find the relationship of the end effectors with the root. You can determine the forward
+        direction. Also, the sign of the direction 
+        2. It's very easy to find the spine. The start is the root and the end is the first joint with 3 children.
+        3. The spine tells the up direction.
+        """
+        def get_joint_world_position(joint: SkeletonJoint) -> np.ndarray:
+            pos = np.zeros(3)
+            current = joint
+            while current is not None:
+                pos += np.asarray(current.offset).flatten()
+                current = current.parent
+            return pos
+
+        def normalize(v: np.ndarray) -> np.ndarray:
+            n = np.linalg.norm(v)
+            return v if n < 1e-8 else v / n
+
+        def vector_to_axis_name(vector: np.ndarray) -> str:
+            v = np.asarray(vector, dtype=float)
+            if np.linalg.norm(v) < 1e-8:
+                return "y"
+            v = v / np.linalg.norm(v)
+            abs_components = np.abs(v)
+            idx = int(np.argmax(abs_components))
+            axis = ['x', 'y', 'z'][idx]
+            sign = '-' if v[idx] < 0 else ''
+            return f"{sign}{axis}"
+
+        def depth_to_three_children(node: SkeletonJoint, max_depth: int = 12) -> int:
+            from collections import deque
+            queue = deque([(node, 0)])
+            best = None
+            while queue:
+                cur, d = queue.popleft()
+                if d > max_depth:
+                    continue
+                if len(cur.children) == 3:
+                    best = d if best is None else min(best, d)
+                for c in cur.children:
+                    queue.append((c, d + 1))
+            return best if best is not None else 10**9
+
+        def longest_single_chain_depth(node: SkeletonJoint, max_depth: int = 32) -> int:
+            depth = 0
+            cur = node
+            while depth < max_depth and cur is not None and len(cur.children) == 1:
+                cur = cur.children[0]
+                depth += 1
+            return depth
+
+        if not self.skeleton:
+            return {"forward": "x", "up": "y"}
+
+        root = self.skeleton
+
+        # Find spine-like path: from root towards the first node with exactly 3 children (excluding root)
+        path = [root]
+        current = root
+        for _ in range(64):
+            if current is not root and len(current.children) == 3:
+                break
+            if not current.children:
+                break
+            if len(current.children) == 1:
+                current = current.children[0]
+                path.append(current)
+                continue
+            children = current.children
+            depths = [depth_to_three_children(c) for c in children]
+            min_depth = min(depths)
+            if min_depth < 10**9:
+                next_child = children[int(np.argmin(depths))]
+            else:
+                chain_depths = [longest_single_chain_depth(c) for c in children]
+                next_child = children[int(np.argmax(chain_depths))]
+            current = next_child
+            path.append(current)
+
+        chest = current
+        root_pos = get_joint_world_position(root)
+        chest_pos = get_joint_world_position(chest)
+        spine_vec = chest_pos - root_pos
+        if np.linalg.norm(spine_vec) < 1e-8:
+            # Fallback: use highest joint in world Y as top reference
+            all_nodes: list[SkeletonJoint] = []
+            def collect(n: SkeletonJoint):
+                all_nodes.append(n)
+                for c in n.children:
+                    collect(c)
+            collect(root)
+            if len(all_nodes) >= 2:
+                top = max(all_nodes, key=lambda j: get_joint_world_position(j)[1])
+                spine_vec = get_joint_world_position(top) - root_pos
+            else:
+                spine_vec = np.array([0.0, 1.0, 0.0])
+
+        up_dir = normalize(spine_vec)
+        up_axis = vector_to_axis_name(up_dir)
+
+        # Gather end effectors (leaves)
+        leaves: list[np.ndarray] = []
+        def collect_leaves(n: SkeletonJoint):
+            if not n.children:
+                leaves.append(get_joint_world_position(n))
+                return
+            for c in n.children:
+                collect_leaves(c)
+        collect_leaves(root)
+
+        # Project leaf positions onto plane orthogonal to up, relative to root
+        leaves_rel = []
+        for p in leaves:
+            rel = p - root_pos
+            rel = rel - np.dot(rel, up_dir) * up_dir
+            if np.linalg.norm(rel) > 1e-6:
+                leaves_rel.append(rel)
+
+        forward_axis = "z"
+        if len(leaves_rel) >= 2:
+            X = np.stack(leaves_rel, axis=0)
+            Xc = X - X.mean(axis=0, keepdims=True)
+            if np.linalg.norm(Xc) > 1e-8:
+                U, S, Vt = np.linalg.svd(Xc, full_matrices=False)
+                lr_dir = Vt[0]
+                lr_dir = normalize(lr_dir - np.dot(lr_dir, up_dir) * up_dir)
+                if np.linalg.norm(lr_dir) < 1e-8 and Vt.shape[0] >= 2:
+                    lr_dir = Vt[1]
+                    lr_dir = normalize(lr_dir - np.dot(lr_dir, up_dir) * up_dir)
+                if np.linalg.norm(lr_dir) < 1e-8:
+                    lr_dir = normalize(np.cross(up_dir, np.array([1.0, 0.0, 0.0])))
+                    if np.linalg.norm(lr_dir) < 1e-8:
+                        lr_dir = normalize(np.cross(up_dir, np.array([0.0, 0.0, 1.0])))
+                fwd_dir = np.cross(up_dir, lr_dir)
+                if np.linalg.norm(fwd_dir) < 1e-8 and Vt.shape[0] >= 2:
+                    fwd_dir = Vt[1]
+                    fwd_dir = normalize(fwd_dir - np.dot(fwd_dir, up_dir) * up_dir)
+                proj_means = (X.mean(axis=0))
+                if np.dot(proj_means, fwd_dir) < 0:
+                    fwd_dir = -fwd_dir
+                forward_axis = vector_to_axis_name(fwd_dir)
+        else:
+            avg = np.zeros(3) if len(leaves_rel) == 0 else normalize(np.mean(np.stack(leaves_rel, axis=0), axis=0))
+            if np.linalg.norm(avg) < 1e-8:
+                cand = np.array([1.0, 0.0, 0.0])
+                if abs(np.dot(cand, up_dir)) > 0.8:
+                    cand = np.array([0.0, 0.0, 1.0])
+                fwd_dir = normalize(np.cross(up_dir, cand))
+            else:
+                avg = avg - np.dot(avg, up_dir) * up_dir
+                fwd_dir = normalize(avg)
+            forward_axis = vector_to_axis_name(fwd_dir)
+
+        return {"forward": forward_axis, "up": up_axis}
+
     def align_orientation(self, new_orientation: dict[str, str]):
         """
         Align the skeleton to a new orientation by transforming bone directions,
@@ -986,10 +1149,10 @@ class Skeleton:
             """Recursively scale the offset of a joint and its children."""
             if joint.offset.size > 0:
                 # Scale the joint's offset vector
-                joint.offset = np.array([
-                    joint.offset[0] * x,
-                    joint.offset[1] * y,
-                    joint.offset[2] * z
+                joint.offset *= np.array([
+                    x,
+                    y,
+                    z
                 ])
 
             # Recursively scale children
