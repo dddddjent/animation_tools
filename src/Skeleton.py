@@ -208,7 +208,7 @@ class Skeleton:
                 for child in joint.children:
                     child_name_lower = child.name.lower()
                     if any(pattern in child_name_lower for pattern in
-                          ['finger', 'thumb', 'index', 'middle', 'ring', 'pinky', 'phalange', 'digit']):
+                           ['finger', 'thumb', 'index', 'middle', 'ring', 'pinky', 'phalange', 'digit']):
                         finger_like_children += 1
 
                 # If majority of children are finger-like, remove this joint
@@ -275,7 +275,7 @@ class Skeleton:
 
         if (len(root.children) == 1 and
             root.positions.size > 0 and
-            root.children[0].positions.size == 0):
+                root.children[0].positions.size == 0):
 
             child = root.children[0]
 
@@ -289,10 +289,12 @@ class Skeleton:
             has_multiple_children = len(child.children) >= 2
 
             if is_hips_like or has_multiple_children:
-                print(f"Removing redundant root '{root.name}' and moving motion to '{child.name}'")
+                print(
+                    f"Removing redundant root '{root.name}' and moving motion to '{child.name}'")
 
                 # Check if root has meaningful translation (not all zeros)
-                root_has_translation = root.positions.size > 0 and not np.allclose(root.positions, 0)
+                root_has_translation = root.positions.size > 0 and not np.allclose(
+                    root.positions, 0)
 
                 # Only transfer root motion if it has meaningful translation
                 if root_has_translation:
@@ -304,9 +306,11 @@ class Skeleton:
                     # but still add child's offset to maintain rest pose relationship
                     if child.positions.size == 0:
                         # If child has no positions, create positions array with child's offset
-                        num_frames = child.rotations.qs.shape[0] if hasattr(child.rotations, 'qs') else 0
+                        num_frames = child.rotations.qs.shape[0] if hasattr(
+                            child.rotations, 'qs') else 0
                         if num_frames > 0:
-                            child.positions = np.tile(child.offset, (num_frames, 1))
+                            child.positions = np.tile(
+                                child.offset, (num_frames, 1))
                     else:
                         # If child has positions, add child's offset
                         child.positions = child.positions + child.offset
@@ -623,9 +627,12 @@ class Skeleton:
         # Calculate spine direction (from bottom to top)
         if len(spine_joints) >= 2:
             # Use the bottom and top spine joints
-            spine_bottom = min(spine_joints, key=lambda j: get_joint_world_position(j)[1])
-            spine_top = max(spine_joints, key=lambda j: get_joint_world_position(j)[1])
-            spine_vector = get_joint_world_position(spine_top) - get_joint_world_position(spine_bottom)
+            spine_bottom = min(
+                spine_joints, key=lambda j: get_joint_world_position(j)[1])
+            spine_top = max(
+                spine_joints, key=lambda j: get_joint_world_position(j)[1])
+            spine_vector = get_joint_world_position(
+                spine_top) - get_joint_world_position(spine_bottom)
         else:
             # Use the single spine joint's offset as direction
             spine_vector = spine_joints[0].offset
@@ -644,8 +651,10 @@ class Skeleton:
 
         if left_arm_joints and right_arm_joints:
             # Use the farthest joints in each arm (typically hands/wrists)
-            left_endpoints = [max(left_arm_joints, key=lambda j: np.linalg.norm(get_joint_world_position(j)))]
-            right_endpoints = [max(right_arm_joints, key=lambda j: np.linalg.norm(get_joint_world_position(j)))]
+            left_endpoints = [
+                max(left_arm_joints, key=lambda j: np.linalg.norm(get_joint_world_position(j)))]
+            right_endpoints = [
+                max(right_arm_joints, key=lambda j: np.linalg.norm(get_joint_world_position(j)))]
         else:
             # Fall back to legs
             left_leg_joints = find_joints_by_label("LeftLeg")
@@ -653,8 +662,10 @@ class Skeleton:
 
             if left_leg_joints and right_leg_joints:
                 # Use the farthest joints in each leg (typically feet/toes)
-                left_endpoints = [max(left_leg_joints, key=lambda j: np.linalg.norm(get_joint_world_position(j)))]
-                right_endpoints = [max(right_leg_joints, key=lambda j: np.linalg.norm(get_joint_world_position(j)))]
+                left_endpoints = [
+                    max(left_leg_joints, key=lambda j: np.linalg.norm(get_joint_world_position(j)))]
+                right_endpoints = [
+                    max(right_leg_joints, key=lambda j: np.linalg.norm(get_joint_world_position(j)))]
 
         # Convert up_axis to a vector for cross product calculation
         up_components = {'x': 0, 'y': 1, 'z': 2, '-x': 0, '-y': 1, '-z': 2}
@@ -711,7 +722,8 @@ class Skeleton:
         current_orientation = self.orientation
 
         # Calculate transformation quaternion from current to new orientation
-        transform_quat = self._calculate_orientation_transform(current_orientation, new_orientation)
+        transform_quat = self._calculate_orientation_transform(
+            current_orientation, new_orientation)
 
         # Apply transformation to all components
         self._transform_root_positions(transform_quat)
@@ -722,7 +734,7 @@ class Skeleton:
         self.orientation = new_orientation.copy()
 
     def _calculate_orientation_transform(self, current_orientation: dict[str, str],
-                                        new_orientation: dict[str, str]) -> Quaternions:
+                                         new_orientation: dict[str, str]) -> Quaternions:
         """
         Calculate the quaternion transformation from current to new orientation.
         """
@@ -773,7 +785,8 @@ class Skeleton:
             return Quaternions.identity()
 
         # Convert to quaternion
-        transform_quat = Quaternions.from_transforms(transform_matrix.reshape(1, 3, 3))
+        transform_quat = Quaternions.from_transforms(
+            transform_matrix.reshape(1, 3, 3))
 
         return transform_quat
 
@@ -931,4 +944,70 @@ class Skeleton:
         # Calculate height difference (positive value)
         height_from_hips_to_bottom = root_height_component - min_height_component
 
-        return max(0.0, height_from_hips_to_bottom)  # Ensure non-negative result
+        # Ensure non-negative result
+        return max(0.0, height_from_hips_to_bottom)
+
+    def translate_rest_root(self, delta: np.ndarray):
+        """
+        Translate the rest root of the skeleton by a given delta.
+        """
+        if not self.skeleton:
+            return
+        self.skeleton.offset = self.skeleton.offset + delta
+
+    def scale(self, x: float, y: float, z: float):
+        """
+        Scale the skeleton's joint offsets by the given x, y, z factors.
+
+        Parameters
+        ----------
+        x : float
+            Scale factor for the x-axis
+        y : float
+            Scale factor for the y-axis
+        z : float
+            Scale factor for the z-axis
+        """
+        if not self.skeleton:
+            return
+
+        def scale_joint_offsets(joint: SkeletonJoint):
+            """Recursively scale the offset of a joint and its children."""
+            if joint.offset.size > 0:
+                # Scale the joint's offset vector
+                joint.offset = np.array([
+                    joint.offset[0] * x,
+                    joint.offset[1] * y,
+                    joint.offset[2] * z
+                ])
+
+            # Recursively scale children
+            for child in joint.children:
+                scale_joint_offsets(child)
+
+        # Start scaling from the root joint
+        scale_joint_offsets(self.skeleton)
+        self.skeleton.positions[:,] *= np.array([x, y, z])
+
+    def regularize(self, new_orientation: dict[str, str], new_height: float) -> float:
+        old_height = self.get_height()
+        scale_factor = new_height / old_height
+        self.scale(scale_factor, scale_factor, scale_factor)
+        self.align_orientation(new_orientation)
+
+        self.translate_rest_root(-self.skeleton.offset)
+
+        # Translate according to the up direction
+        up_axis = self.orientation.get('up', 'y')
+        up_vectors = {
+            'x': np.array([1, 0, 0]), '-x': np.array([-1, 0, 0]),
+            'y': np.array([0, 1, 0]), '-y': np.array([0, -1, 0]),
+            'z': np.array([0, 0, 1]), '-z': np.array([0, 0, -1])
+        }
+        up_vector = up_vectors.get(up_axis, np.array(
+            [0, 1, 0]))  # default to y if invalid
+        height = self.get_height_from_hips_to_bottom()
+        translation = up_vector * height
+        self.translate_rest_root(translation)
+
+        return old_height
