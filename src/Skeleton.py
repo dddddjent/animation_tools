@@ -45,7 +45,7 @@ class Skeleton:
         },
     }
 
-    def __init__(self, animation: Animation, names: list, frametime: float):
+    def __init__(self, animation: Animation, names: list, frametime: float, default_orientation: dict[str, str] | None = None):
         """
         Initialize the Skeleton with data from BVH.load().
 
@@ -57,6 +57,9 @@ class Skeleton:
             List of joint names
         frametime : float
             Frame time in seconds
+        default_orientation : dict[str, str] | None, optional
+            Default orientation dictionary with 'forward' and 'up' keys, by default None.
+            If None, orientation will be guessed automatically.
         """
         self.frametime = frametime
 
@@ -66,10 +69,15 @@ class Skeleton:
         self.remove_unwanted_joints()
         self.remove_redundant_root()
         self._label_skeleton()
-        self.orientation = self.guess_orientations()
+
+        # Use provided orientation or guess it
+        if default_orientation is not None:
+            self.orientation = default_orientation.copy()
+        else:
+            self.orientation = self.guess_orientations()
 
     @staticmethod
-    def load(filename):
+    def load(filename, default_orientation: dict[str, str] | None = None):
         """
         Load a skeleton from a BVH file.
 
@@ -77,6 +85,9 @@ class Skeleton:
         ----------
         filename : str
             Path to the BVH file
+        default_orientation : dict[str, str] | None, optional
+            Default orientation dictionary with 'forward' and 'up' keys, by default None.
+            If None, orientation will be guessed automatically.
 
         Returns
         -------
@@ -84,7 +95,7 @@ class Skeleton:
             A new Skeleton instance loaded from the BVH file
         """
         animation, names, frametime = BVH.load(filename)
-        return Skeleton(animation, names, frametime)
+        return Skeleton(animation, names, frametime, default_orientation)
 
     def _build_joint_tree(self, animation: Animation, names: list) -> SkeletonJoint:
         """
